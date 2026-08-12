@@ -9,11 +9,11 @@ import { resolveModelRuntimeLimits } from './runtimeMetadata.js'
 
 // All three sides of the Ling Tiny availability window (availableUntil on
 // the gitlawb-opengateway catalog entry, mirroring the gateway's
-// LING_TINY_FREE_END_ISO = 2026-08-13T10:00:00Z). The cutoff itself is
+// LING_TINY_FREE_END_ISO = 2026-08-17T10:00:00Z). The cutoff itself is
 // exclusive: at exactly the cutoff instant the entry is already gone.
 const DURING_WINDOW = new Date('2026-08-12T00:00:00Z')
-const AT_CUTOFF = new Date('2026-08-13T10:00:00Z')
-const AFTER_WINDOW = new Date('2026-08-13T10:00:01Z')
+const AT_CUTOFF = new Date('2026-08-17T10:00:00Z')
+const AFTER_WINDOW = new Date('2026-08-17T10:00:01Z')
 
 describe('Ling 3.0 Tiny :free descriptor', () => {
   test('exposes the Tiny capabilities and limits to gateway catalogs', () => {
