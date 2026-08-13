@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { describe, it, expect } from 'bun:test'
+import { describe, it, expect, spyOn } from 'bun:test'
 import {
   acquireSharedMutationLock,
   releaseSharedMutationLock,
@@ -16,6 +16,7 @@ import {
   getDiscoveryCacheKey,
   getRouteDiscoveryHeaders,
 } from './discoveryService'
+import { setClaudeConfigHomeDirForTesting } from '../utils/envUtils.js'
 
 const originalConfigDir = process.env.CLAUDE_CONFIG_DIR
 
@@ -24,6 +25,7 @@ async function withTempConfigDir<T>(fn: () => Promise<T>): Promise<T> {
   let tempDir: string | null = null
   try {
     tempDir = mkdtempSync(join(tmpdir(), 'openclaude-runtime-metadata-test-'))
+    setClaudeConfigHomeDirForTesting(tempDir)
     process.env.CLAUDE_CONFIG_DIR = tempDir
     return await fn()
   } finally {
@@ -36,6 +38,7 @@ async function withTempConfigDir<T>(fn: () => Promise<T>): Promise<T> {
       if (tempDir) {
         rmSync(tempDir, { recursive: true, force: true })
       }
+      setClaudeConfigHomeDirForTesting(undefined)
     } finally {
       releaseSharedMutationLock()
     }
@@ -71,6 +74,50 @@ describe('resolveModelRuntimeLimits', () => {
           },
         }).contextWindow,
       ).toBe(1_000_000)
+    })
+  })
+
+  it('uses the stable xAI OAuth cache identity for discovered runtime limits', async () => {
+    await withTempConfigDir(async () => {
+      const xaiCredentials = await import('../utils/xaiCredentials.js')
+      const readSpy = spyOn(xaiCredentials, 'getCachedXaiCredentials').mockReturnValue({
+        accessToken: 'rotating-access-token',
+        refreshToken: 'stable-account-identity',
+        tokenEndpoint: 'https://auth.x.ai/oauth/token',
+      })
+      try {
+        const baseUrl = 'https://api.x.ai/v1'
+        await setCachedModels(
+          getDiscoveryCacheKey('xai', {
+            baseUrl,
+            apiKey: 'rotating-access-token',
+            cacheKey: 'stable-account-identity',
+          }),
+          {
+            models: [
+              {
+                id: 'grok-4.7',
+                apiName: 'grok-4.7',
+                label: 'grok-4.7',
+                contextWindow: 500_000,
+              },
+            ],
+          },
+        )
+
+        expect(
+          resolveModelRuntimeLimits({
+            model: 'grok-4.7',
+            processEnv: {
+              CLAUDE_CODE_USE_OPENAI: '1',
+              OPENAI_BASE_URL: baseUrl,
+              XAI_CREDENTIAL_SOURCE: 'oauth',
+            },
+          }).contextWindow,
+        ).toBe(500_000)
+      } finally {
+        readSpy.mockRestore()
+      }
     })
   })
   it('uses built-in Z.AI GLM-5.2 runtime limits', () => {
@@ -462,6 +509,17 @@ describe('resolveOpenAIShimRuntimeContext - Moonshot and Kimi Code catalog metad
     expect(result.catalogEntry?.reasoning?.levels).toEqual(['low', 'medium', 'high'])
     expect(result.catalogEntry?.reasoning?.defaultLevel).toBe('medium')
   })
+
+  it('resolves the official Grok 4.5 grok-build-latest alias on Atlas Cloud', () => {
+    const result = resolveOpenAIShimRuntimeContext({
+      model: 'grok-build-latest',
+      baseUrl: 'https://api.atlascloud.ai/v1',
+      processEnv: { CLAUDE_CODE_USE_OPENAI: '1' },
+    })
+    expect(result.routeId).toBe('atlas-cloud')
+    expect(result.catalogEntry?.id).toBe('xai/grok-4.5')
+    expect(result.catalogEntry?.reasoning?.levels).toEqual(['low', 'medium', 'high'])
+  })
 })
 
 describe('resolveOpenAIShimRuntimeContext - GLM catalog-aware gating', () => {
@@ -646,6 +704,33 @@ describe('resolveOpenAIShimRuntimeContext - Hicap catalog metadata', () => {
     expect(gpt55.openaiShimConfig.requiredApiFormat).toBe('responses')
     expect(gpt55.openaiShimConfig.maxTokensField).toBe('max_completion_tokens')
 
+    const grok46 = resolveOpenAIShimRuntimeContext({
+      model: 'grok-4.6',
+      baseUrl: 'https://api.hicap.ai/v1',
+      processEnv: { CLAUDE_CODE_USE_OPENAI: '1' },
+    })
+    expect(grok46.catalogEntry?.id).toBe('hicap-grok-4.6')
+    expect(grok46.catalogEntry?.reasoning?.levels).toEqual([
+      'low',
+      'medium',
+      'high',
+      'xhigh',
+    ])
+
+    const grok46Latest = resolveOpenAIShimRuntimeContext({
+      model: 'grok-4.6-latest',
+      baseUrl: 'https://api.hicap.ai/v1',
+      processEnv: { CLAUDE_CODE_USE_OPENAI: '1' },
+    })
+    expect(grok46Latest.catalogEntry?.id).toBe('hicap-grok-4.6')
+
+    const grokBuildLatest = resolveOpenAIShimRuntimeContext({
+      model: 'grok-build-latest',
+      baseUrl: 'https://api.hicap.ai/v1',
+      processEnv: { CLAUDE_CODE_USE_OPENAI: '1' },
+    })
+    expect(grokBuildLatest.catalogEntry?.id).toBe('hicap-grok-4.5')
+
     const grok = resolveOpenAIShimRuntimeContext({
       model: 'grok-4.3',
       baseUrl: 'https://api.hicap.ai/v1',
@@ -661,6 +746,36 @@ describe('resolveOpenAIShimRuntimeContext - Hicap catalog metadata', () => {
 
 describe('resolveOpenAIShimRuntimeContext - xAI catalog metadata', () => {
   it('uses live xAI model metadata and per-model shim overrides', () => {
+    expect(
+      resolveModelRuntimeLimits({
+        model: 'grok-4.6',
+        baseUrl: 'https://api.x.ai/v1',
+        processEnv: { CLAUDE_CODE_USE_OPENAI: '1' },
+      }),
+    ).toEqual({ contextWindow: 500_000 })
+
+    const grok46 = resolveOpenAIShimRuntimeContext({
+      model: 'grok-4.6-latest',
+      baseUrl: 'https://api.x.ai/v1',
+      processEnv: { CLAUDE_CODE_USE_OPENAI: '1' },
+    })
+    expect(grok46.routeId).toBe('xai')
+    expect(grok46.catalogEntry?.id).toBe('grok-4.6')
+    expect(grok46.catalogEntry?.reasoning?.levels).toEqual([
+      'low',
+      'medium',
+      'high',
+      'xhigh',
+    ])
+
+    expect(
+      resolveModelRuntimeLimits({
+        model: 'grok-4.5',
+        baseUrl: 'https://api.x.ai/v1',
+        processEnv: { CLAUDE_CODE_USE_OPENAI: '1' },
+      }),
+    ).toEqual({ contextWindow: 500_000, maxOutputTokens: 32_768 })
+
     expect(
       resolveModelRuntimeLimits({
         model: 'grok-4.20-0309-reasoning',

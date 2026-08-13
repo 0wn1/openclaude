@@ -19,6 +19,7 @@ import {
 } from './registry.js'
 import {
   getRouteDescriptor,
+  isCanonicalXaiInferenceBaseUrl,
   resolveRouteCredentialValue,
   resolveActiveRouteIdFromEnv,
   resolveRouteIdFromBaseUrl,
@@ -27,6 +28,10 @@ import {
 import { parseCustomHeadersEnv } from '../utils/providerCustomHeaders.js'
 import { firstUsableCredential } from '../services/api/credentialPool.js'
 import { ZAI_GLM_OPENAI_SHIM } from './transport/zaiGlmShim.js'
+import {
+  getCachedXaiCredentials,
+  getXaiDiscoveryCacheIdentity,
+} from '../utils/xaiCredentials.js'
 import { resolveAimlapiAttributionHeaders } from './aimlapi/config.js'
 
 function resolveRouteOpenAIShimConfig(
@@ -454,15 +459,22 @@ function findCachedCatalogEntryForApiName(
   }
 
   const baseUrl = runtimeEnv.OPENAI_BASE_URL ?? runtimeEnv.OPENAI_API_BASE
+  let apiKey = firstUsableCredential(
+    resolveRouteCredentialValue({ routeId, baseUrl, processEnv: runtimeEnv }),
+  )
+  let cacheIdentity: string | undefined
+  if (!apiKey && routeId === 'xai' && isCanonicalXaiInferenceBaseUrl(baseUrl)) {
+    // Runtime limit resolution is synchronous request planning. Discovery
+    // populates this memory cache asynchronously; do not launch a credential
+    // store subprocess here merely to recover optional dynamic metadata.
+    const credentials = getCachedXaiCredentials()
+    apiKey = firstUsableCredential(credentials?.accessToken)
+    cacheIdentity = getXaiDiscoveryCacheIdentity(credentials) ?? apiKey
+  }
   const cacheKey = getDiscoveryCacheKey(routeId, {
     baseUrl,
-    apiKey: firstUsableCredential(
-      resolveRouteCredentialValue({
-        routeId,
-        baseUrl,
-        processEnv: runtimeEnv,
-      }),
-    ),
+    apiKey,
+    cacheKey: cacheIdentity,
     headers: parseCustomHeadersEnv(runtimeEnv.ANTHROPIC_CUSTOM_HEADERS),
   })
   const cached = getCachedModelsSync(cacheKey, getDiscoveryCacheTtlMs(routeId))
