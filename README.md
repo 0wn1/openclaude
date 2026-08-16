@@ -185,7 +185,17 @@ usually `~/.openclaude/bg-sessions/`; `OPENCLAUDE_CONFIG_DIR` can point
 OpenClaude somewhere else. `CLAUDE_CONFIG_DIR` is ignored for OpenClaude
 background-session storage. Session names can be reused after older sessions
 reach a terminal state; use the session ID to inspect older logs with the same
-name.
+name. A naturally finished session is recorded as `exited` when its process
+returns zero and `failed` when it returns nonzero or handles a termination
+signal. `stale` remains the conservative result when the process disappears
+without an observed outcome; an explicit successful `openclaude kill` is
+recorded as `killed`, and `killed` takes precedence over a natural `exited` or
+`failed` outcome for the same process. Terminal outcomes are stored separately
+under `bg-sessions/terminal/`; deleting that directory makes finished sessions
+fall back to liveness-derived status. OpenClaude does not infer POSIX signal
+names on Windows.
+Unobservable force termination, host crashes, and power loss remain `stale` on
+every platform.
 
 `openclaude attach <id-or-name>` currently reports the matching session and
 points to `openclaude logs <id> -f`; full terminal reattach is not implemented
