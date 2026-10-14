@@ -21,6 +21,7 @@ import {
   buildConcentrateProfileEnv,
   buildCodexProfileEnv,
   buildGeminiProfileEnv,
+  buildGmiCloudProfileEnv,
   buildLaunchEnv,
   buildOllamaProfileEnv,
   buildOpenAIProfileEnv,
@@ -261,6 +262,37 @@ test('openai launch preserves persisted dedicated vendor credentials across rest
   assert.equal(env.ATLAS_CLOUD_API_KEY, 'atlas-secret-key')
 })
 
+test('openai launch preserves a persisted GMI Cloud key and prefers a live one', async () => {
+  const persisted = profile('openai', {
+    OPENAI_BASE_URL: 'https://api.gmi-serving.com/v1',
+    OPENAI_MODEL: 'deepseek-ai/DeepSeek-V4-Pro',
+    OPENAI_API_KEY: 'gmi-old-key',
+    GMI_API_KEY: 'gmi-old-key',
+  })
+
+  const restarted = await buildLaunchEnv({
+    profile: 'openai',
+    persisted,
+    goal: 'coding',
+    processEnv: {},
+  })
+
+  assert.equal(restarted.OPENAI_BASE_URL, 'https://api.gmi-serving.com/v1')
+  assert.equal(restarted.OPENAI_MODEL, 'deepseek-ai/DeepSeek-V4-Pro')
+  assert.equal(restarted.GMI_API_KEY, 'gmi-old-key')
+
+  const rotated = await buildLaunchEnv({
+    profile: 'openai',
+    persisted,
+    goal: 'coding',
+    processEnv: {
+      GMI_API_KEY: 'gmi-rotated-key',
+    },
+  })
+
+  assert.equal(rotated.GMI_API_KEY, 'gmi-rotated-key')
+})
+
 test('openai launch preserves persisted ApiSmart dedicated credentials across restart', async () => {
   const env = await buildLaunchEnv({
     profile: 'openai',
@@ -348,6 +380,40 @@ test('openai launch never promotes an ambient generic key to an ApiSmart credent
     }),
     undefined,
   )
+})
+
+test('buildGmiCloudProfileEnv never sends the GMI key to an ambient or non-GMI base URL', () => {
+  const ambient = buildGmiCloudProfileEnv({
+    apiKey: 'gmi-secret-key',
+    processEnv: {
+      OPENAI_BASE_URL: 'https://api.openai.com/v1',
+      OPENAI_API_KEY: 'sk-openai-other',
+    },
+  })
+  assert.equal(ambient?.OPENAI_BASE_URL, 'https://api.gmi-serving.com/v1')
+  assert.equal(ambient?.OPENAI_API_KEY, 'gmi-secret-key')
+  assert.equal(ambient?.GMI_API_KEY, 'gmi-secret-key')
+
+  const custom = buildGmiCloudProfileEnv({
+    apiKey: 'gmi-secret-key',
+    baseUrl: 'https://proxy.example/v1',
+    processEnv: {},
+  })
+  assert.equal(custom?.OPENAI_BASE_URL, 'https://api.gmi-serving.com/v1')
+
+  const plainHttp = buildGmiCloudProfileEnv({
+    apiKey: 'gmi-secret-key',
+    baseUrl: 'http://api.gmi-serving.com/v1',
+    processEnv: {},
+  })
+  assert.equal(plainHttp?.OPENAI_BASE_URL, 'https://api.gmi-serving.com/v1')
+
+  const explicit = buildGmiCloudProfileEnv({
+    apiKey: 'gmi-secret-key',
+    baseUrl: 'https://api.gmi-serving.com/v1/',
+    processEnv: {},
+  })
+  assert.equal(explicit?.OPENAI_BASE_URL, 'https://api.gmi-serving.com/v1/')
 })
 
 test('buildApismartProfileEnv prefers APISMART_MODEL over OPENAI_MODEL', () => {

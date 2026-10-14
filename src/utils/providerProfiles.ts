@@ -29,6 +29,7 @@ import {
   buildXaiOAuthProfileEnv,
   buildXiaomiMimoProfileEnv,
   buildAtlasCloudProfileEnv,
+  buildGmiCloudProfileEnv,
   buildApismartProfileEnv,
   buildVertexProfileEnv,
   clearManagedProfileEnv,
@@ -61,6 +62,7 @@ import {
   isCanonicalLlmtrInferenceBaseUrl,
   isCanonicalCommandcodeInferenceBaseUrl,
   isFireworksBaseUrl,
+  isGmiCloudBaseUrl,
   isLongcatBaseUrl,
   isNearaiBaseUrl,
   isXaiBaseUrl,
@@ -950,6 +952,10 @@ function isProcessEnvAlignedWithProfile(
       ? !includeApiKey ||
         sameOptionalEnvValue(processEnv.ATLAS_CLOUD_API_KEY, profile.apiKey)
       : true) &&
+    (isGmiCloudBaseUrl(profile.baseUrl)
+      ? !includeApiKey ||
+        sameOptionalEnvValue(processEnv.GMI_API_KEY, profile.apiKey)
+      : true) &&
     (isApismartProfile(profile)
       ? !includeApiKey ||
         sameOptionalEnvValue(processEnv.APISMART_API_KEY, profile.apiKey)
@@ -1131,7 +1137,9 @@ export function applyProviderProfileToProcessEnv(
               ? getRouteDefaultBaseUrl('api-route') ?? profile.baseUrl
               : route.routeId === 'commandcode' && !profile.baseUrl?.trim()
                 ? getRouteDefaultBaseUrl('commandcode') ?? profile.baseUrl
-                : profile.baseUrl
+                : route.routeId === 'gmi-cloud' && !profile.baseUrl?.trim()
+                  ? getRouteDefaultBaseUrl('gmi-cloud') ?? profile.baseUrl
+                  : profile.baseUrl
     const openAIProfileEnv: ProfileEnv = {
       OPENAI_BASE_URL: normalizedProfileBaseUrl,
       OPENAI_MODEL: primaryModel,
@@ -1168,13 +1176,17 @@ export function applyProviderProfileToProcessEnv(
       route.routeId === 'llmtr' && !isLlmtrProfile(profile)
     const withholdRetargetedCommandcodeCredential =
       route.routeId === 'commandcode' && !isCommandcodeProfile(profile)
+    // A gmi-cloud profile's key belongs to GMI: never install it for another URL.
+    const withholdRetargetedGmiCloudCredential =
+      route.routeId === 'gmi-cloud' && !isGmiCloudBaseUrl(normalizedProfileBaseUrl)
     if (
       profile.apiKey &&
       !withholdRetargetedApismartCredential &&
       !withholdRetargetedConcentrateCredential &&
       !withholdRetargetedApiRouteCredential &&
       !withholdRetargetedLlmtrCredential &&
-      !withholdRetargetedCommandcodeCredential
+      !withholdRetargetedCommandcodeCredential &&
+      !withholdRetargetedGmiCloudCredential
     ) {
       openAIProfileEnv.OPENAI_API_KEY = profile.apiKey
       if (route.vendorId === 'minimax' || normalizedProfileBaseUrl.toLowerCase().includes('minimax')) {
@@ -1208,6 +1220,9 @@ export function applyProviderProfileToProcessEnv(
       }
       if (route.routeId === 'atlas-cloud' || normalizedProfileBaseUrl.toLowerCase().includes('atlascloud')) {
         openAIProfileEnv.ATLAS_CLOUD_API_KEY = profile.apiKey
+      }
+      if (isGmiCloudBaseUrl(normalizedProfileBaseUrl)) {
+        openAIProfileEnv.GMI_API_KEY = profile.apiKey
       }
       if (isApismartProfile(profile)) {
         openAIProfileEnv.APISMART_API_KEY = profile.apiKey
@@ -1703,6 +1718,10 @@ function buildOpenAICompatibleStartupEnv(
       if (activeProfile.baseUrl?.toLowerCase().includes('atlascloud')) {
         strictEnv.ATLAS_CLOUD_API_KEY = activeProfile.apiKey
       }
+      // GMI Cloud is dedicatedCredentialsOnly too.
+      if (isGmiCloudBaseUrl(activeProfile.baseUrl)) {
+        strictEnv.GMI_API_KEY = activeProfile.apiKey
+      }
       if (isApismartProfile(activeProfile)) {
         strictEnv.APISMART_API_KEY = activeProfile.apiKey
       }
@@ -1818,6 +1837,9 @@ function buildOpenAICompatibleStartupEnv(
     }
     if (activeProfile.baseUrl?.toLowerCase().includes('atlascloud')) {
       env.ATLAS_CLOUD_API_KEY = activeProfile.apiKey
+    }
+    if (isGmiCloudBaseUrl(activeProfile.baseUrl)) {
+      env.GMI_API_KEY = activeProfile.apiKey
     }
     if (isApismartProfile(activeProfile)) {
       env.APISMART_API_KEY = activeProfile.apiKey
@@ -2019,6 +2041,19 @@ function buildStartupProfileFromActiveProfile(
       if (route.routeId === 'atlas-cloud') {
         const env =
           buildAtlasCloudProfileEnv({
+            model: getPrimaryModel(activeProfile.model),
+            baseUrl: activeProfile.baseUrl,
+            apiKey: activeProfile.apiKey,
+            processEnv: process.env,
+          }) ?? null
+        return env
+          ? { profile: 'openai', env: applySupportedProfileCustomHeaders(activeProfile, env) }
+          : null
+      }
+
+      if (route.routeId === 'gmi-cloud') {
+        const env =
+          buildGmiCloudProfileEnv({
             model: getPrimaryModel(activeProfile.model),
             baseUrl: activeProfile.baseUrl,
             apiKey: activeProfile.apiKey,

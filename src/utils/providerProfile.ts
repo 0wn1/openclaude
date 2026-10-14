@@ -29,6 +29,7 @@ import {
   isCanonicalApismartInferenceBaseUrl,
   isCanonicalConcentrateInferenceBaseUrl,
   isCanonicalLlmtrInferenceBaseUrl,
+  isGmiCloudBaseUrl,
   isCanonicalCommandcodeInferenceBaseUrl,
   isLongcatBaseUrl,
   normalizeXiaomiMimoBaseUrl,
@@ -117,6 +118,7 @@ const PROFILE_ENV_KEYS = [
   'VENICE_API_KEY',
   'MIMO_API_KEY',
   'ATLAS_CLOUD_API_KEY',
+  'GMI_API_KEY',
   'APISMART_API_KEY',
   'APISMART_MODEL',
   'API_ROUTE_API_KEY',
@@ -221,6 +223,7 @@ export type ProfileEnv = {
   VENICE_API_KEY?: string
   MIMO_API_KEY?: string
   ATLAS_CLOUD_API_KEY?: string
+  GMI_API_KEY?: string
   APISMART_API_KEY?: string
   API_ROUTE_API_KEY?: string
   CLINE_API_KEY?: string
@@ -664,6 +667,51 @@ export function buildAtlasCloudProfileEnv(options: {
       defaultModel,
     OPENAI_API_KEY: key,
     ATLAS_CLOUD_API_KEY: key,
+  }
+}
+
+export function buildGmiCloudProfileEnv(options: {
+  model?: string | null
+  baseUrl?: string | null
+  apiKey?: string | null
+  processEnv?: NodeJS.ProcessEnv
+}): ProfileEnv | null {
+  const processEnv = options.processEnv ?? process.env
+  const key = sanitizeApiKey(options.apiKey ?? processEnv.GMI_API_KEY)
+  if (!key) {
+    return null
+  }
+
+  const defaultBaseUrl = getRouteDefaultBaseUrl('gmi-cloud')
+  const defaultModel = getRouteDefaultModel('gmi-cloud')
+  if (!defaultBaseUrl || !defaultModel) {
+    throw new Error('GMI Cloud route defaults are missing from integration metadata.')
+  }
+  const secretSource: SecretValueSource = {
+    OPENAI_API_KEY: key,
+    GMI_API_KEY: key,
+  }
+  // The GMI key only ever travels to GMI's inference API: ignore an ambient
+  // OPENAI_BASE_URL (it may belong to another provider) and fall back to the
+  // default when the profile's URL is not GMI's.
+  const explicitBaseUrl = sanitizeProviderConfigValue(options.baseUrl, secretSource)
+  const baseUrl =
+    explicitBaseUrl && isGmiCloudBaseUrl(explicitBaseUrl)
+      ? explicitBaseUrl
+      : defaultBaseUrl
+
+  return {
+    OPENAI_BASE_URL: baseUrl,
+    OPENAI_MODEL:
+      normalizeProfileModel(
+        sanitizeProviderConfigValue(options.model, secretSource),
+      ) ||
+      normalizeProfileModel(
+        sanitizeProviderConfigValue(processEnv.OPENAI_MODEL, secretSource),
+      ) ||
+      defaultModel,
+    OPENAI_API_KEY: key,
+    GMI_API_KEY: key,
   }
 }
 
@@ -2240,6 +2288,7 @@ export async function buildLaunchEnv(options: {
   }
   for (const dedicatedKey of [
     'ATLAS_CLOUD_API_KEY',
+    'GMI_API_KEY',
     'APISMART_API_KEY',
     'CONCENTRATE_API_KEY',
     'LLMTR_API_KEY',
