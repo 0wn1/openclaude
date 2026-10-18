@@ -1,4 +1,5 @@
 import { afterEach, beforeAll, beforeEach, expect, test } from 'bun:test'
+import { applyAgentProviderOverrideToEnv } from '../services/api/agentRouting.js'
 import { ensureIntegrationsLoaded, getAllGateways } from '../integrations/index.js'
 import {
   acquireSharedMutationLock,
@@ -577,6 +578,24 @@ test('minimax validation accepts MINIMAX_API_KEY on minimax chat host alias', as
   await expect(getProviderValidationError(process.env)).resolves.toBeNull()
 })
 
+for (const baseEnv of ['OPENAI_BASE_URL', 'OPENAI_API_BASE']) {
+  for (const credentialEnv of ['OPENAI_API_KEY', 'OPENAI_API_KEYS']) {
+    test(`MiniMax China startup accepts ${credentialEnv} with ${baseEnv}`, async () => {
+      const env: NodeJS.ProcessEnv = {}
+      applyAgentProviderOverrideToEnv({
+        baseURL: 'https://api.minimaxi.com/v1', model: 'MiniMax-M3', apiKey: 'china-test-key',
+      }, env)
+      delete env.OPENAI_BASE_URL
+      delete env.OPENAI_API_KEY
+      env[baseEnv] = 'https://api.minimaxi.com/v1'
+      env[credentialEnv] = 'china-test-key'
+      await expect(getProviderValidationError(env)).resolves.toBeNull()
+      delete env[credentialEnv]
+      await expect(getProviderValidationError(env)).resolves.toContain('MiniMax auth is required')
+    })
+  }
+}
+
 test('nvidia nim validation accepts NVIDIA_API_KEY without OPENAI_API_KEY', async () => {
   process.env.CLAUDE_CODE_USE_OPENAI = '1'
   process.env.OPENAI_BASE_URL = 'https://integrate.api.nvidia.com/v1'
@@ -1001,3 +1020,15 @@ test('startup provider validation stays strict for non-interactive launches', ()
     }),
   ).toBe(true)
 })
+
+for (const baseEnv of ['ANTHROPIC_BASE_URL', 'OPENAI_BASE_URL', 'OPENAI_API_BASE']) {
+  test(`MiniMax HTTP ${baseEnv} reports a structured transport error`, async () => {
+    const env = {
+      ...(baseEnv === 'ANTHROPIC_BASE_URL' ? {} : { CLAUDE_CODE_USE_OPENAI: '1' }),
+      [baseEnv]: 'http://api.minimaxi.com/anthropic', MINIMAX_API_KEY: 'mini-test-key',
+    }
+    await expect(getProviderValidationError(env)).resolves.toBe('MiniMax base URL must use HTTPS')
+    expect(shouldExitForStartupProviderValidationError({ args: [], stdoutIsTTY: true })).toBe(false)
+    expect(shouldExitForStartupProviderValidationError({ args: ['-p', 'hello'], stdoutIsTTY: false })).toBe(true)
+  })
+}

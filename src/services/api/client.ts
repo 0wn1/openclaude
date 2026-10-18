@@ -42,6 +42,8 @@ import {
   getFireworksBaseUrlOverride,
   getLongcatBaseUrlOverride,
   getMiniMaxBaseUrlOverride,
+  getMiniMaxBaseUrlValidationError,
+  isMiniMaxBaseUrl,
   getNearaiBaseUrlOverride,
   isCanonicalApiRouteInferenceBaseUrl,
   isCanonicalApismartInferenceBaseUrl,
@@ -149,13 +151,24 @@ function hasMiniMaxModelIntent(model: string | undefined): boolean {
 function hasConflictingOpenAIBaseUrlForMiniMax(): boolean {
   const openAIBaseUrl =
     process.env.OPENAI_BASE_URL?.trim() || process.env.OPENAI_API_BASE?.trim()
-  return Boolean(openAIBaseUrl && getMiniMaxBaseUrlOverride() === undefined)
+  return Boolean(openAIBaseUrl && !isMiniMaxBaseUrl(openAIBaseUrl))
 }
 
 function shouldUseMiniMaxEnvOnlyProvider(
   model: string | undefined,
   envOnlyProviderRouteId: string | null,
 ): boolean {
+  // An explicit OpenAI endpoint selects its wire protocol, even with a
+  // dedicated MiniMax key. Native defaults must not rewrite that request.
+  if (
+    isEnvTruthy(process.env.CLAUDE_CODE_USE_OPENAI) &&
+    isMiniMaxBaseUrl(
+      process.env.OPENAI_BASE_URL?.trim() || process.env.OPENAI_API_BASE?.trim(),
+    )
+  ) {
+    return false
+  }
+
   const hasMiniMaxCredential =
     process.env.MINIMAX_API_KEY?.trim() ||
     (getMiniMaxBaseUrlOverride() !== undefined &&
@@ -184,6 +197,17 @@ function isXaiModelName(value: string | undefined): boolean {
 }
 
 function applyMiniMaxEnvOnlyDefaults(model: string | undefined): void {
+  const baseUrlOverride = getMiniMaxBaseUrlOverride()
+  const validationError = getMiniMaxBaseUrlValidationError(baseUrlOverride)
+  if (validationError) throw new Error(validationError)
+  // ANTHROPIC_BASE_URL already describes the native endpoint. Legacy OpenAI
+  // URL hints select the region, but still need the native /anthropic path.
+  const baseUrl = isMiniMaxBaseUrl(process.env.ANTHROPIC_BASE_URL)
+    ? process.env.ANTHROPIC_BASE_URL!.trim()
+    : baseUrlOverride
+      ? new URL('/anthropic', baseUrlOverride).toString()
+      : getRouteDefaultBaseUrl('minimax')
+
   const modelOverride =
     (isMiniMaxModelName(model) ? model?.trim() : undefined) ??
     process.env.OPENAI_MODEL?.trim() ??
@@ -197,7 +221,7 @@ function applyMiniMaxEnvOnlyDefaults(model: string | undefined): void {
     process.env.ANTHROPIC_API_KEY = apiKey
   }
 
-  process.env.ANTHROPIC_BASE_URL = 'https://api.minimax.io/anthropic'
+  process.env.ANTHROPIC_BASE_URL = baseUrl
   process.env.ANTHROPIC_MODEL =
     (isMiniMaxModelName(modelOverride)
       ? modelOverride
