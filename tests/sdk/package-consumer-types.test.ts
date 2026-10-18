@@ -10,7 +10,8 @@
  * - Self-referential type wrappers
  */
 import { afterAll, describe, expect, test } from 'bun:test'
-import { execFileSync, execSync } from 'child_process'
+import { execFile, execSync } from 'child_process'
+import { promisify } from 'node:util'
 import { existsSync, mkdirSync, rmSync, writeFileSync, cpSync, readFileSync } from 'fs'
 import { join } from 'path'
 import { randomUUID } from 'crypto'
@@ -91,16 +92,27 @@ function setupConsumerProject(name: string): string {
   return tmpDir
 }
 
-/** Compile consumer.ts in the given tmpDir. Returns stdout (empty = success). */
-function tsc(tmpDir: string): string {
-  return execFileSync(process.execPath, [TSC_BIN, '-p', 'tsconfig.json', '--pretty', 'false'], {
-    cwd: tmpDir,
-    encoding: 'utf-8',
-    timeout: 60000,
-    stdio: ['pipe', 'pipe', 'pipe'],
-  }).trim()
+/** Compile a consumer, rejecting failed builds with their diagnostics and exit metadata. */
+async function tsc(tmpDir: string, compiler = TSC_BIN, timeout = 20_000): Promise<string> {
+  // Finish subprocess cleanup before the 30s test deadline. A synchronous wait
+  // can trap Bun's isolated runner in dangling-process cleanup on timeout.
+  try {
+    const { stdout } = await promisify(execFile)(process.execPath, [compiler, '-p', 'tsconfig.json', '--pretty', 'false'], {
+      cwd: tmpDir,
+      encoding: 'utf-8',
+      timeout,
+      killSignal: 'SIGKILL',
+    })
+    return stdout.trim()
+  } catch (error) {
+    if (error instanceof Error && 'stdout' in error && typeof error.stdout === 'string' && error.stdout.trim()) {
+      error.message += `\n${error.stdout.trim()}`
+    }
+    throw error
+  }
 }
 
+/** Build the CLI and SDK when package-export validation needs missing distribution artifacts. */
 function ensureBuildArtifacts(): void {
   const distCli = join(ROOT, 'dist', 'cli.mjs')
   const distSdk = join(ROOT, 'dist', 'sdk.mjs')
@@ -125,7 +137,33 @@ afterAll(() => {
 
 // tsc compilation can be slow under CPU contention — 30s timeout per test
 describe('package consumer types', () => {
-  test('SDK types compile for external consumer with skipLibCheck:false', () => {
+  test('compiler failures retain their diagnostics and nonzero exit code', async () => {
+    const tmpDir = setupConsumerProject('compiler-diagnostics')
+    writeFileSync(join(tmpDir, 'consumer.ts'), 'const value: string = 123\n')
+    await expect(tsc(tmpDir)).rejects.toMatchObject({
+      code: 2,
+      message: expect.stringContaining('TS2322'),
+    })
+  }, 30_000)
+
+  test('compiler deadline kills a child that ignores graceful termination', async () => {
+    const tmpDir = setupConsumerProject('compiler-timeout')
+    const compiler = join(tmpDir, 'stalled-compiler.cjs')
+    const pidPath = join(tmpDir, 'compiler.pid')
+    writeFileSync(compiler, `
+      process.on('SIGTERM', () => {})
+      require('node:fs').writeFileSync(${JSON.stringify(pidPath)}, String(process.pid))
+      setInterval(() => {}, 1000)
+    `)
+    await expect(tsc(tmpDir, compiler, 3000)).rejects.toMatchObject({
+      killed: true,
+      signal: 'SIGKILL',
+    })
+    const pid = Number(readFileSync(pidPath, 'utf8'))
+    expect(() => process.kill(pid, 0)).toThrow()
+  }, 10_000)
+
+  test('SDK types compile for external consumer with skipLibCheck:false', async () => {
     const tmpDir = setupConsumerProject('basic')
 
     writeFileSync(
@@ -177,10 +215,10 @@ describe('package consumer types', () => {
       ].join('\n'),
     )
 
-    expect(tsc(tmpDir)).toBe('')
+    expect(await tsc(tmpDir)).toBe('')
   }, 30_000)
 
-  test('SDKMessage/SDKUserMessage/SDKResultMessage are re-exported correctly', () => {
+  test('SDKMessage/SDKUserMessage/SDKResultMessage are re-exported correctly', async () => {
     const tmpDir = setupConsumerProject('reexports')
 
     writeFileSync(
@@ -202,10 +240,10 @@ describe('package consumer types', () => {
       ].join('\n'),
     )
 
-    expect(tsc(tmpDir)).toBe('')
+    expect(await tsc(tmpDir)).toBe('')
   }, 30_000)
 
-  test('result usage standard counters are required numbers', () => {
+  test('result usage standard counters are required numbers', async () => {
     const tmpDir = setupConsumerProject('usage-counters')
 
     writeFileSync(
@@ -236,10 +274,10 @@ describe('package consumer types', () => {
       ].join('\n'),
     )
 
-    expect(tsc(tmpDir)).toBe('')
+    expect(await tsc(tmpDir)).toBe('')
   }, 30_000)
 
-  test('SDKRateLimitError has resetsAt and rateLimitType as class properties', () => {
+  test('SDKRateLimitError has resetsAt and rateLimitType as class properties', async () => {
     const tmpDir = setupConsumerProject('ratelimit')
 
     writeFileSync(
@@ -258,10 +296,10 @@ describe('package consumer types', () => {
       ].join('\n'),
     )
 
-    expect(tsc(tmpDir)).toBe('')
+    expect(await tsc(tmpDir)).toBe('')
   }, 30_000)
 
-  test('control initialize response accepts generated model and account values', () => {
+  test('control initialize response accepts generated model and account values', async () => {
     const tmpDir = setupConsumerProject('control-init')
 
     writeFileSync(
@@ -291,7 +329,7 @@ describe('package consumer types', () => {
       ].join('\n'),
     )
 
-    expect(tsc(tmpDir)).toBe('')
+    expect(await tsc(tmpDir)).toBe('')
   }, 30_000)
 })
 
