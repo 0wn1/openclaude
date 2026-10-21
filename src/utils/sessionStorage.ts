@@ -11,12 +11,13 @@ import {
   mkdir,
   readdir,
   readFile,
+  readlink,
   stat,
   unlink,
   writeFile,
 } from 'fs/promises'
 import memoize from 'lodash-es/memoize.js'
-import { basename, dirname, join, resolve as resolvePath } from 'path'
+import { basename, dirname, join, relative, sep, isAbsolute, resolve as resolvePath } from 'path'
 import {
   type AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
   logEvent,
@@ -79,7 +80,8 @@ import { getCwd } from './cwd.js'
 import { logForDebugging } from './debug.js'
 import { logForDiagnosticsNoPII } from './diagLogs.js'
 import { getClaudeConfigHomeDir, getProjectsDir, isEnvTruthy } from './envUtils.js'
-import { isFsInaccessible } from './errors.js'
+import { getErrnoCode, isFsInaccessible } from './errors.js'
+import { getTaskOutputPath } from './task/diskOutput.js'
 import type { FileHistorySnapshot } from './fileHistory.js'
 import { formatFileSize } from './format.js'
 import { getFsImplementation } from './fsOperations.js'
@@ -621,6 +623,35 @@ export function getAgentTranscriptPath(agentId: AgentId): string {
   return join(base, `agent-${agentId}.jsonl`)
 }
 
+// Completion can retain a transcript submitted before /clear. Reuse that
+// task's exact output link when no current-session transcript exists; do not
+// search historical sessions. Metadata must follow the same selected file.
+async function getAgentTranscriptReadPath(agentId: AgentId): Promise<string> {
+  const currentPath = getAgentTranscriptPath(agentId)
+  try {
+    await stat(currentPath)
+    return currentPath
+  } catch (error) {
+    if (getErrnoCode(error) !== 'ENOENT') throw error
+  }
+  const outputPath = getTaskOutputPath(agentId)
+  try {
+    const target = resolvePath(dirname(outputPath), await readlink(outputPath))
+    const relativePath = relative(getProjectsDir(), target)
+    const parts = relativePath.split(sep)
+    // Accept only generated project/session/subagents paths for this agent.
+    // Grouping directories and the resumed project override can be released
+    // before this read. Require a destination recorded by this agent's producer.
+    if (!isAbsolute(relativePath) && parts[0] !== '..' && parts.length >= 4 &&
+      validateUuid(parts[1]) && parts[2] === 'subagents' &&
+      parts.at(-1) === `agent-${agentId}.jsonl` &&
+      getProject().sidechainProducerPaths.get(agentId)?.has(target)) return target
+  } catch (error) {
+    if (!isFsInaccessible(error) && getErrnoCode(error) !== 'EINVAL') throw error
+  }
+  return currentPath
+}
+
 function getAgentMetadataPath(agentId: AgentId): string {
   return getAgentTranscriptPath(agentId).replace(/\.jsonl$/, '.meta.json')
 }
@@ -663,8 +694,8 @@ export async function writeAgentMetadata(
 export async function readAgentMetadata(
   agentId: AgentId,
 ): Promise<AgentMetadata | null> {
-  const path = getAgentMetadataPath(agentId)
   try {
+    const path = (await getAgentTranscriptReadPath(agentId)).replace(/\.jsonl$/, '.meta.json')
     const raw = await readFile(path, 'utf-8')
     return JSON.parse(raw) as AgentMetadata
   } catch (e) {
@@ -916,6 +947,8 @@ export function setRemoteIngressUrlForTesting(url: string): void {
 }
 
 const REMOTE_FLUSH_INTERVAL_MS = 10
+
+type SidechainDestination = { path: string; sessionId: UUID }
 
 class Project {
   // Minimal cache for current session only (not all sessions)
@@ -1631,12 +1664,59 @@ class Project {
     }
   }
 
+  private sidechainWrites = new Map<string, Promise<void>>()
+  // Producer destinations outlive /clear and project/subdirectory overrides.
+  readonly sidechainProducerPaths = new Map<string, Set<string>>()
+
+  private async appendSidechainEntry(agentId: string, path: string, data: string): Promise<void> {
+    await this.appendToFile(path, data)
+    let paths = this.sidechainProducerPaths.get(agentId)
+    if (!paths) {
+      paths = new Set()
+      this.sidechainProducerPaths.set(agentId, paths)
+    }
+    paths.add(resolvePath(path))
+  }
+
+  insertSidechainTranscript(
+    messages: Transcript,
+    agentId?: string,
+    startingParentUuid?: UUID | null,
+    captureDestination = true,
+  ): Promise<void> {
+    // Track the predecessor wait too: shutdown flushes must see queued chains.
+    return this.trackWrite(async () => {
+      if (!agentId) {
+        return this.insertMessageChain(messages, true, agentId, startingParentUuid)
+      }
+      // Handoff can restart the same agent before its old iterator has closed.
+      // Join whole chains; the file lock alone only serializes single appends.
+      const destination: SidechainDestination | undefined = captureDestination ? {
+        path: getAgentTranscriptPath(asAgentId(agentId)),
+        sessionId: getSessionId() as UUID,
+      } : undefined
+      // Live-path producers still serialize chains, without freezing a session.
+      const path = destination?.path ?? `live:${agentId}`
+      const previous = this.sidechainWrites.get(path)
+      const write = (previous?.catch(() => {}) ?? Promise.resolve()).then(() =>
+        this.insertMessageChain(messages, true, agentId, startingParentUuid, undefined, destination),
+      )
+      this.sidechainWrites.set(path, write)
+      try {
+        await write
+      } finally {
+        if (this.sidechainWrites.get(path) === write) this.sidechainWrites.delete(path)
+      }
+    })
+  }
+
   async insertMessageChain(
     messages: Transcript,
     isSidechain: boolean = false,
     agentId?: string,
     startingParentUuid?: UUID | null,
     teamInfo?: { teamName?: string; agentName?: string },
+    sidechainDestination?: SidechainDestination,
   ) {
     return this.trackWrite(async () => {
       let parentUuid: UUID | null = startingParentUuid ?? null
@@ -1644,7 +1724,10 @@ class Project {
       // First conversation message materializes the session file.
       // Hook progress/attachment messages and local-command bookkeeping
       // alone stay buffered.
-      if (this.sessionFile === null && messages.some(startsConversation)) {
+      if (
+        this.sessionFile === null && messages.some(startsConversation) &&
+        (!sidechainDestination || sidechainDestination.sessionId === getSessionId())
+      ) {
         await this.materializeSessionFile()
       }
 
@@ -1658,7 +1741,7 @@ class Project {
       }
 
       // Get slug if one exists for this session (used for plan files, etc.)
-      const sessionId = getSessionId()
+      const sessionId = sidechainDestination?.sessionId ?? getSessionId()
       const slug = getPlanSlugCache().get(sessionId)
 
       for (const message of messages) {
@@ -1701,7 +1784,7 @@ class Project {
           gitBranch,
           slug,
         }
-        await this.appendEntry(transcriptMessage)
+        await this.appendEntry(transcriptMessage, sidechainDestination?.sessionId, sidechainDestination)
         const shouldTrackReplay = !this.shouldSkipPersistence()
         if (shouldTrackReplay && !isSidechain && message.type === 'user') {
           const content = getFirstMeaningfulUserMessageTextContent([message])
@@ -1819,8 +1902,19 @@ class Project {
     })
   }
 
-  async appendEntry(entry: Entry, sessionId: UUID = getSessionId() as UUID) {
+  async appendEntry(
+    entry: Entry,
+    sessionId: UUID = getSessionId() as UUID,
+    sidechainDestination?: SidechainDestination,
+  ) {
     if (this.shouldSkipPersistence()) {
+      return
+    }
+
+    if (sidechainDestination && isTranscriptMessage(entry) && entry.isSidechain && entry.agentId !== undefined) {
+      // The queue key, session stamp and every append belong to the submission,
+      // even if /clear changes the active session while this chain is waiting.
+      await this.appendSidechainEntry(entry.agentId, sidechainDestination.path, jsonStringify(entry) + '\n')
       return
     }
 
@@ -1941,8 +2035,13 @@ class Project {
         // exhausts retries → gracefulShutdownSync(1). See inc-4718.
         const isNewUuid = !messageSet.has(entry.uuid)
         if (isAgentSidechain || isNewUuid) {
-          // Enqueue write — appendToFile handles ENOENT by creating directories
-          void this.enqueueWrite(targetFile, entry)
+          if (isAgentSidechain) {
+            // Agent completion awaits this producer. Use the existing per-file
+            // append/lock path so unrelated session queues cannot gate output.
+            await this.appendSidechainEntry(entry.agentId!, targetFile, jsonStringify(entry) + '\n')
+          } else {
+            void this.enqueueWrite(targetFile, entry)
+          }
 
           if (!isAgentSidechain) {
             // messageSet is main-file-authoritative. Sidechain entries go to a
@@ -2202,12 +2301,10 @@ export async function recordSidechainTranscript(
   messages: Message[],
   agentId?: string,
   startingParentUuid?: UUID | null,
+  { captureDestination = true }: { captureDestination?: boolean } = {},
 ) {
-  await getProject().insertMessageChain(
-    cleanMessagesForLogging(messages),
-    true,
-    agentId,
-    startingParentUuid,
+  await getProject().insertSidechainTranscript(
+    cleanMessagesForLogging(messages), agentId, startingParentUuid, captureDestination,
   )
 }
 
@@ -5308,9 +5405,8 @@ export async function getAgentTranscript(agentId: AgentId): Promise<{
   messages: Message[]
   contentReplacements: ContentReplacementRecord[]
 } | null> {
-  const agentFile = getAgentTranscriptPath(agentId)
-
   try {
+    const agentFile = await getAgentTranscriptReadPath(agentId)
     const { messages, agentContentReplacements } =
       await loadTranscriptFile(agentFile)
 

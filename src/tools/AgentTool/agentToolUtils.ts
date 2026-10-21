@@ -615,11 +615,9 @@ export async function runAsyncAgentLifecycle({
 
     const agentResult = finalizeAgentTool(agentMessages, taskId, metadata)
 
-    // Mark task completed FIRST so TaskOutput(block=true) unblocks
-    // immediately. classifyHandoffIfNeeded (API call) and getWorktreeResult
-    // (git exec) are notification embellishments that can hang — they must
-    // not gate the status transition (gh-20236).
-    completeAsyncAgent(agentResult, rootSetAppState)
+    // Transcript writes are awaited by runAgent; completion joins the output link.
+    // Keep notification embellishments after the terminal state (gh-20236).
+    if (!await completeAsyncAgent(agentResult, rootSetAppState)) return
 
     let finalMessage = extractTextContent(agentResult.content, '\n')
 

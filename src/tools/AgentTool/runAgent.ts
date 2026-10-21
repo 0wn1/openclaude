@@ -45,6 +45,7 @@ import type {
 } from '../../types/message.js'
 import { createAttachmentMessage } from '../../utils/attachments.js'
 import { AbortError } from '../../utils/errors.js'
+import { raceAbort } from '../../utils/boundedAsync.js'
 import { getDisplayPath } from '../../utils/file.js'
 import {
   cloneFileStateCache,
@@ -65,6 +66,7 @@ import { resolveAgentRunModelRouting, shouldEnforceModelAllowlist } from '../../
 import { getInitialSettings } from '../../utils/settings/settings.js'
 import {
   clearAgentTranscriptSubdir,
+  getAgentTranscriptPath,
   recordSidechainTranscript,
   setAgentTranscriptSubdir,
   writeAgentMetadata,
@@ -850,21 +852,44 @@ export async function* runAgent({
     logForDebugging(`Failed to write agent metadata: ${_err}`)
   }
 
-  // Record initial messages before the query loop starts.
-  // Fire-and-forget — persistence failure shouldn't block the agent.
-  // Only write the transcript if identity metadata was successfully persisted,
-  // ensuring we never leave a transcript that would resume without its restricted identity.
-  if (metadataWritten) {
-    void recordSidechainTranscript(initialMessages, agentId).catch(_err =>
-      logForDebugging(`Failed to record sidechain transcript: ${_err}`),
-    )
-  } else {
-    logForDebugging('Skipping initial transcript write because identity metadata persistence failed')
+  let transcriptDestination: string | undefined
+  agentToolUseContext.getAgentTranscriptPath = id => id === agentId ? transcriptDestination : undefined
+
+  function recordAgentTranscript(messages: Message[], parentUuid?: UUID | null) {
+    const outputDestination = getAgentTranscriptPath(agentId)
+    transcriptDestination = outputDestination
+    // Storage captures this same path synchronously. Publish submission order,
+    // so an older delayed write cannot replace a newer session's destination.
+    const write = recordSidechainTranscript(messages, agentId, parentUuid)
+    rootSetAppState(prev => {
+      const task = prev.tasks?.[agentId]
+      if (task?.type !== 'local_agent' || task.outputDestination === outputDestination) return prev
+      return { ...prev, tasks: { ...prev.tasks, [agentId]: { ...task, outputDestination } } }
+    })
+    return write
   }
-  // Track the last recorded message UUID for parent chain continuity
+
+  // Track the last recorded message UUID for parent chain continuity.
   let lastRecordedUuid: UUID | null = initialMessages.at(-1)?.uuid ?? null
 
   try {
+    // Serialize the initial transcript with subsequent writes. The producer
+    // resolves after the local append, without flushing unrelated sessions.
+    // Preserve the identity-metadata gate and best-effort persistence policy.
+    if (metadataWritten) {
+      // Storage owns a cleaned message array and tracks this producer even
+      // when cancellation releases the runner before its append finishes.
+      await raceAbort(
+        recordAgentTranscript(initialMessages),
+        agentAbortController.signal,
+      ).catch(err => {
+        if (agentAbortController.signal.aborted) throw new AbortError()
+        logForDebugging(`Failed to record sidechain transcript: ${err}`)
+      })
+    } else {
+      logForDebugging('Skipping initial transcript write because identity metadata persistence failed')
+    }
+    if (agentAbortController.signal.aborted) throw new AbortError()
     let queryTerminal: Terminal | undefined
     const configuredMaxSteps =
       Number.isSafeInteger(maxSteps) && maxSteps! > 0
@@ -929,13 +954,13 @@ export async function* runAgent({
           // Record only the new message with correct parent (O(1) per message)
           // Only write if identity metadata was successfully persisted.
           if (metadataWritten) {
-            await recordSidechainTranscript(
-              [message],
-              agentId,
-              lastRecordedUuid,
-            ).catch(err =>
-              logForDebugging(`Failed to record sidechain transcript: ${err}`),
-            )
+            await raceAbort(
+              recordAgentTranscript([message], lastRecordedUuid),
+              agentAbortController.signal,
+            ).catch(err => {
+              if (agentAbortController.signal.aborted) throw new AbortError()
+              logForDebugging(`Failed to record sidechain transcript: ${err}`)
+            })
           }
           if (message.type !== 'progress') {
             lastRecordedUuid = message.uuid

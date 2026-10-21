@@ -18,6 +18,7 @@ import type { AppState } from '../../state/AppState.js'
 import { isInProcessTeammateTask } from '../../tasks/InProcessTeammateTask/types.js'
 import {
   isLocalAgentTask,
+  initAgentTaskOutput,
   type LocalAgentTaskState,
 } from '../../tasks/LocalAgentTask/LocalAgentTask.js'
 import { isLocalShellTask } from '../../tasks/LocalShellTask/guards.js'
@@ -43,7 +44,6 @@ import {
 } from '../../utils/sessionStorage.js'
 import {
   evictTaskOutput,
-  initTaskOutputAsSymlink,
 } from '../../utils/task/diskOutput.js'
 import { getCurrentWorktreeSession } from '../../utils/worktree.js'
 import { clearSessionCaches } from './caches.js'
@@ -221,18 +221,27 @@ export async function clearConversation({
 
   // Preserved local_agent tasks had their TaskOutput symlink baked against the
   // old session ID at spawn time, but post-clear transcript writes land under
-  // the new session directory (appendEntry re-reads getSessionId()). Re-point
+  // the new session directory (new chains capture the current session). Re-point
   // the symlinks so TaskOutput reads the live file instead of a frozen pre-clear
   // snapshot. Only re-point running tasks — finished tasks will never write
   // again, so re-pointing would replace a valid symlink with a dangling one.
   // Main-session tasks use the same per-agent path (they write via
   // recordSidechainTranscript to getAgentTranscriptPath), so no special case.
   for (const task of preservedLocalAgents) {
-    if (task.status !== 'running') continue
-    void initTaskOutputAsSymlink(
-      task.id,
-      getAgentTranscriptPath(asAgentId(task.agentId)),
-    )
+    // Re-read after clear's awaits: completion may have finished the producer
+    // since preservedLocalAgents was captured, without publishing success yet.
+    const currentTask = getAppState?.().tasks[task.id]
+    if (!isLocalAgentTask(currentTask) || currentTask.status !== 'running' || currentTask.producerFinished) continue
+    const destination = getAgentTranscriptPath(asAgentId(task.agentId))
+    const outputReady = initAgentTaskOutput(task.id, destination)
+    void outputReady.catch(() => {})
+    // Publish before yielding so completion joins this replacement. Once
+    // completion starts, producerFinished prevents any further retargeting.
+    setAppState?.(prev => {
+      const current = prev.tasks[task.id]
+      if (!isLocalAgentTask(current) || current.status !== 'running' || current.producerFinished) return prev
+      return { ...prev, tasks: { ...prev.tasks, [task.id]: { ...current, outputReady } } }
+    })
   }
 
   // Re-persist mode and worktree state after the clear so future --resume

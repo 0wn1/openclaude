@@ -1151,11 +1151,9 @@ export const AgentTool = buildTool({
                     }
                     const agentResult = finalizeAgentTool(agentMessages, backgroundedTaskId, metadata);
 
-                    // Mark task completed FIRST so TaskOutput(block=true)
-                    // unblocks immediately. classifyHandoffIfNeeded and
-                    // cleanupWorktreeIfNeeded can hang — they must not gate
-                    // the status transition (gh-20236).
-                    completeAsyncAgent(agentResult, rootSetAppState);
+                    // Transcript writes are awaited by runAgent; completion joins the output link.
+                    // Keep notification embellishments after the terminal state (gh-20236).
+                    if (!await completeAsyncAgent(agentResult, rootSetAppState)) return;
 
                     // Extract text from agent result content for the notification
                     let finalMessage = extractTextContent(agentResult.content, '\n');
