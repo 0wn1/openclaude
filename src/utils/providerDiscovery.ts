@@ -2,6 +2,7 @@ import type { OllamaModelDescriptor } from './providerRecommendation.ts'
 import { DEFAULT_OPENAI_BASE_URL } from '../services/api/providerConfig.js'
 import {
   getRouteLabel,
+  isCanonicalMergeGatewayInferenceBaseUrl,
   resolveRouteIdFromBaseUrl,
 } from '../integrations/routeMetadata.js'
 
@@ -158,6 +159,27 @@ export function getOpenAICompatibleModelsBaseUrl(baseUrl?: string): string {
   ).replace(/\/+$/, '')
 }
 
+export function getOpenAICompatibleModelsUrl(
+  baseUrl?: string,
+  discoveryPath?: string,
+): string {
+  const resolvedBaseUrl = getOpenAICompatibleModelsBaseUrl(baseUrl)
+  if (!discoveryPath?.trim()) {
+    return `${resolvedBaseUrl}/models`
+  }
+
+  const parsedBaseUrl = new URL(resolvedBaseUrl)
+  const resolvedUrl = new URL(
+    discoveryPath.trim(),
+    `${resolvedBaseUrl}/`,
+  )
+  if (resolvedUrl.origin !== parsedBaseUrl.origin) {
+    throw new Error('Model discovery path must stay on the provider origin')
+  }
+
+  return resolvedUrl.toString()
+}
+
 export function getLocalOpenAICompatibleProviderLabel(baseUrl?: string): string {
   try {
     const parsed = new URL(getOpenAICompatibleModelsBaseUrl(baseUrl))
@@ -263,11 +285,15 @@ export async function listOpenAICompatibleModels(options?: {
   baseUrl?: string
   apiKey?: string
   headers?: Record<string, string>
+  path?: string
 }): Promise<string[] | null> {
   const { signal, clear } = withTimeoutSignal(5000)
   try {
-    const baseUrl = getOpenAICompatibleModelsBaseUrl(options?.baseUrl)
-    const isBankr = baseUrl.toLowerCase().includes('bankr')
+    const modelsUrl = getOpenAICompatibleModelsUrl(
+      options?.baseUrl,
+      options?.path,
+    )
+    const isBankr = modelsUrl.toLowerCase().includes('bankr')
     const headers = {
       ...(options?.headers ?? {}),
       ...(options?.apiKey
@@ -277,7 +303,7 @@ export async function listOpenAICompatibleModels(options?: {
         : {}),
     }
     const response = await fetch(
-      `${baseUrl}/models`,
+      modelsUrl,
       {
         method: 'GET',
         headers: Object.keys(headers).length > 0 ? headers : undefined,
@@ -306,15 +332,62 @@ export async function listOpenAICompatibleModels(options?: {
   }
 }
 
+// Merge's native catalog is paginated. Only a complete result may enter the
+// shared discovery cache; an incomplete refresh retains its existing fallback.
+export async function fetchMergeGatewayModelsRaw(options: {
+  baseUrl?: string
+  apiKey?: string
+}): Promise<Record<string, unknown>[] | null> {
+  if (!isCanonicalMergeGatewayInferenceBaseUrl(options.baseUrl)) return null
+  try {
+    const url = new URL('/v1/models', options.baseUrl)
+    const models: Record<string, unknown>[] = []
+    const cursors = new Set<string>()
+    for (let page = 0; page < 100; page++) {
+      const { signal, clear } = withTimeoutSignal(5000)
+      try {
+        const response = await fetch(url.toString(), {
+          method: 'GET',
+          headers: options.apiKey ? { Authorization: `Bearer ${options.apiKey}` } : undefined,
+          signal,
+          redirect: 'error',
+        })
+        if (!response.ok) return null
+        const payload = await response.json() as {
+          data?: Record<string, unknown>[]
+          has_more?: boolean
+          next_cursor?: string | null
+        }
+        if (!Array.isArray(payload.data)) return null
+        models.push(...payload.data)
+        if (!payload.has_more) return models
+        const cursor = payload.next_cursor
+        if (typeof cursor !== 'string' || !cursor || cursors.has(cursor)) return null
+        cursors.add(cursor)
+        url.searchParams.set('cursor', cursor)
+      } finally {
+        clear()
+      }
+    }
+    return null
+  } catch {
+    return null
+  }
+}
+
 export async function fetchOpenAICompatibleModelsRaw(options?: {
   baseUrl?: string
   apiKey?: string
   headers?: Record<string, string>
+  path?: string
 }): Promise<Record<string, unknown>[] | null> {
   const { signal, clear } = withTimeoutSignal(5000)
   try {
-    const baseUrl = getOpenAICompatibleModelsBaseUrl(options?.baseUrl)
-    const isBankr = baseUrl.toLowerCase().includes('bankr')
+    const modelsUrl = getOpenAICompatibleModelsUrl(
+      options?.baseUrl,
+      options?.path,
+    )
+    const isBankr = modelsUrl.toLowerCase().includes('bankr')
     const headers = {
       ...(options?.headers ?? {}),
       ...(options?.apiKey
@@ -323,7 +396,7 @@ export async function fetchOpenAICompatibleModelsRaw(options?: {
           : { Authorization: `Bearer ${options.apiKey}` }
         : {}),
     }
-    const response = await fetch(`${baseUrl}/models`, {
+    const response = await fetch(modelsUrl, {
       method: 'GET',
       headers: Object.keys(headers).length > 0 ? headers : undefined,
       signal,

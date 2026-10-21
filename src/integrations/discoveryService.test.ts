@@ -25,6 +25,7 @@ const originalEnv = {
   OPENAI_AUTH_HEADER_VALUE: process.env.OPENAI_AUTH_HEADER_VALUE,
   OPENAI_AUTH_SCHEME: process.env.OPENAI_AUTH_SCHEME,
   APISMART_API_KEY: process.env.APISMART_API_KEY,
+  MERGE_GATEWAY_API_KEY: process.env.MERGE_GATEWAY_API_KEY,
   ANTHROPIC_CUSTOM_HEADERS: process.env.ANTHROPIC_CUSTOM_HEADERS,
   CLAUDE_CODE_USE_OPENAI: process.env.CLAUDE_CODE_USE_OPENAI,
   CLAUDE_CODE_USE_GEMINI: process.env.CLAUDE_CODE_USE_GEMINI,
@@ -70,6 +71,7 @@ function clearProviderEnv(): void {
   delete process.env.OPENAI_AUTH_HEADER_VALUE
   delete process.env.OPENAI_AUTH_SCHEME
   delete process.env.APISMART_API_KEY
+  delete process.env.MERGE_GATEWAY_API_KEY
   delete process.env.ANTHROPIC_CUSTOM_HEADERS
   delete process.env.CLAUDE_CODE_USE_OPENAI
   delete process.env.CLAUDE_CODE_USE_GEMINI
@@ -111,6 +113,7 @@ afterEach(() => {
     restoreEnvValue('OPENAI_AUTH_HEADER_VALUE')
     restoreEnvValue('OPENAI_AUTH_SCHEME')
     restoreEnvValue('APISMART_API_KEY')
+    restoreEnvValue('MERGE_GATEWAY_API_KEY')
     restoreEnvValue('ANTHROPIC_CUSTOM_HEADERS')
     restoreEnvValue('CLAUDE_CODE_USE_OPENAI')
     restoreEnvValue('CLAUDE_CODE_USE_GEMINI')
@@ -128,6 +131,195 @@ afterEach(() => {
 })
 
 describe('discoverModelsForRoute', () => {
+  test('uses Merge Gateway native discovery with its dedicated credential', async () => {
+    const { discoverModelsForRoute } = await loadDiscoveryServiceModule()
+    process.env.MERGE_GATEWAY_API_KEY = 'merge-key'
+    process.env.OPENAI_API_KEY = 'unrelated-openai-key'
+
+    let requestUrl: string | null = null
+    let authorization: string | null = null
+    setMockFetch(mock((input: string | URL | Request, init?: RequestInit) => {
+      requestUrl =
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url
+      authorization = new Headers(init?.headers).get('authorization')
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            data: [
+              {
+                model: 'anthropic/claude-sonnet-5',
+                display_name: 'Claude Sonnet 5',
+              },
+            ],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ),
+      )
+    }) as unknown as typeof globalThis.fetch)
+
+    const result = await discoverModelsForRoute('merge-gateway', {
+      forceRefresh: true,
+    })
+
+    expect<string | null>(requestUrl).toBe(
+      'https://api-gateway.merge.dev/v1/models',
+    )
+    expect<string | null>(authorization).toBe('Bearer merge-key')
+    expect(result).toMatchObject({
+      routeId: 'merge-gateway',
+      source: 'network',
+      discoveredModelCount: 1,
+    })
+  })
+
+  test('publishes only conversational Merge models to the catalog and cache', async () => {
+    const { discoverModelsForRoute } = await loadDiscoveryServiceModule()
+    process.env.MERGE_GATEWAY_API_KEY = 'merge-key'
+    const nativeModel = (model: string, input: string[], output: string[]) => ({
+      model, vendors: { native: { capabilities: { input, output } } },
+    })
+    const models = [
+      nativeModel('anthropic/claude-sonnet-5', ['text', 'image', 'document'], ['text', 'tool_use']),
+      nativeModel('provider/audio-chat', ['text', 'audio'], ['text', 'audio']),
+      {
+        model: 'provider/multi-vendor-chat', vendors: {
+          speech: { capabilities: { input: ['text'], output: ['audio'] } },
+          chat: { capabilities: { input: ['text'], output: ['text'] } },
+        },
+      },
+      // Modalities, rather than names, also exclude unknown media/model families.
+      nativeModel('provider/vector-v1', ['text'], ['embedding']),
+      nativeModel('provider/narrator-v1', ['text'], ['audio']),
+      nativeModel('provider/movie-v1', ['text', 'image'], ['video']),
+      nativeModel('provider/painter-v1', ['text'], ['image']),
+      nativeModel('provider/transcription-v1', ['audio'], ['text']),
+      nativeModel('provider/ranker-v1', ['text'], ['score']),
+      // Sparse native/compatible payloads still exclude known non-chat families.
+      { model: 'google/gemini-embedding-001' },
+      { model: 'minimax/speech-2.6-turbo' },
+      { id: 'google/veo-3.1-generate-001' },
+    ]
+    const fetchMock = mock(() => Promise.resolve(new Response(JSON.stringify({ data: models, has_more: false }))))
+    setMockFetch(fetchMock as unknown as typeof globalThis.fetch)
+    const result = await discoverModelsForRoute('merge-gateway', { forceRefresh: true })
+    expect(result).toMatchObject({ source: 'network', discoveredModelCount: 3, error: null })
+    expect(result?.models.map(model => model.apiName)).toEqual([
+      'default_routing', 'openai/gpt-5.5',
+      'anthropic/claude-sonnet-5', 'provider/audio-chat', 'provider/multi-vendor-chat',
+    ])
+    const cached = await discoverModelsForRoute('merge-gateway')
+    expect(cached?.source).toBe('cache')
+    expect(cached?.models).toEqual(result?.models)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  test('withholds explicit and ambient Merge keys from retargeted discovery', async () => {
+    const { discoverModelsForRoute } = await loadDiscoveryServiceModule()
+    process.env.MERGE_GATEWAY_API_KEY = 'merge-secret'
+    const authorizations: Array<string | null> = []
+    setMockFetch(mock((_input: string | URL | Request, init?: RequestInit) => {
+      authorizations.push(new Headers(init?.headers).get('authorization'))
+      return Promise.resolve(new Response(JSON.stringify({ data: [] })))
+    }) as unknown as typeof globalThis.fetch)
+    for (const apiKey of [undefined, 'merge-secret']) {
+      await discoverModelsForRoute('merge-gateway', {
+        baseUrl: 'https://proxy.example/v1', apiKey, forceRefresh: true,
+      })
+    }
+    expect(authorizations).toEqual([])
+  })
+
+  test('caches the complete native Merge catalog after cursor continuation', async () => {
+    const { discoverModelsForRoute } = await loadDiscoveryServiceModule()
+    process.env.MERGE_GATEWAY_API_KEY = 'merge-key'
+    const urls: string[] = []
+    setMockFetch(mock((input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(String(input))
+      urls.push(url.toString())
+      expect(new Headers(init?.headers).get('authorization')).toBe('Bearer merge-key')
+      expect(url.origin).toBe('https://api-gateway.merge.dev')
+      const second = url.searchParams.get('cursor') === 'page/2?opaque=1'
+      return Promise.resolve(new Response(JSON.stringify({
+        data: second ? [{ model: 'provider/later' }, { model: 'provider/first' }] : [{ model: 'provider/first' }],
+        has_more: !second, next_cursor: second ? null : 'page/2?opaque=1',
+      })))
+    }) as unknown as typeof globalThis.fetch)
+    const result = await discoverModelsForRoute('merge-gateway', { forceRefresh: true })
+    expect(result).toMatchObject({ source: 'network', discoveredModelCount: 2, error: null })
+    expect(result?.models.map(model => model.apiName)).toContain('provider/later')
+    expect(urls).toHaveLength(2)
+    expect((await discoverModelsForRoute('merge-gateway'))?.source).toBe('cache')
+    expect(urls).toHaveLength(2)
+  })
+
+  test('allows each Merge discovery page its own timeout', async () => {
+    const { discoverModelsForRoute } = await loadDiscoveryServiceModule()
+    process.env.MERGE_GATEWAY_API_KEY = 'merge-key'
+    let calls = 0
+    const fetchMock = mock(async (_input: string | URL | Request, init?: RequestInit) => {
+      const page = ++calls
+      const signal = init?.signal
+      await new Promise<void>((resolve, reject) => {
+        const onAbort = () => {
+          clearTimeout(timer)
+          signal?.removeEventListener('abort', onAbort)
+          reject(signal?.reason)
+        }
+        const timer = setTimeout(() => {
+          signal?.removeEventListener('abort', onAbort)
+          resolve()
+        }, 2000)
+        signal?.addEventListener('abort', onAbort, { once: true })
+        if (signal?.aborted) onAbort()
+      })
+      return new Response(JSON.stringify({
+        data: [{ model: `provider/page-${page}` }],
+        has_more: page < 3, next_cursor: page < 3 ? `page-${page + 1}` : null,
+      }))
+    })
+    setMockFetch(fetchMock as unknown as typeof globalThis.fetch)
+
+    const result = await discoverModelsForRoute('merge-gateway', { forceRefresh: true })
+    expect(result).toMatchObject({ source: 'network', discoveredModelCount: 3, error: null })
+    expect(result?.models.map(model => model.apiName).filter(name => name.startsWith('provider/page-'))).toEqual([
+      'provider/page-1', 'provider/page-2', 'provider/page-3',
+    ])
+    const cached = await discoverModelsForRoute('merge-gateway')
+    expect(cached?.source).toBe('cache')
+    expect(cached?.models).toEqual(result?.models)
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+  }, 15_000)
+
+  test.each(['http-error', 'repeated-cursor', 'missing-cursor', 'page-bound'])('incomplete Merge discovery preserves fallback: %s', async failure => {
+    const { discoverModelsForRoute } = await loadDiscoveryServiceModule()
+    process.env.MERGE_GATEWAY_API_KEY = 'merge-key'
+    for (const withCache of [false, true]) {
+      if (withCache) {
+        setMockFetch(mock(() => Promise.resolve(new Response(JSON.stringify({data: [{model: 'provider/complete'}], has_more: false})))) as unknown as typeof globalThis.fetch)
+        await discoverModelsForRoute('merge-gateway', {forceRefresh: true})
+      }
+      let calls = 0
+      setMockFetch(mock(() => {
+        calls++
+        if (failure === 'http-error' && calls > 1) return Promise.resolve(new Response('unavailable', { status: 503 }))
+        return Promise.resolve(new Response(JSON.stringify({
+          data: [{ model: 'provider/partial' }], has_more: true,
+          next_cursor: failure === 'missing-cursor' ? null : failure === 'page-bound' ? 'page-' + calls : 'page-2',
+        })))
+      }) as unknown as typeof globalThis.fetch)
+      const result = await discoverModelsForRoute('merge-gateway', {forceRefresh: true})
+      expect(result?.error).not.toBeNull()
+      expect(result?.models.map(model => model.apiName)).not.toContain('provider/partial')
+      expect(result?.models.map(model => model.apiName)).toContain(withCache ? 'provider/complete' : 'default_routing')
+      expect(result?.source).toBe('stale-cache')
+      expect(calls).toBeLessThanOrEqual(100)
+    }
+  })
+
   test('does not send an ApiSmart key to an overridden discovery URL', async () => {
     const { discoverModelsForRoute } = await loadDiscoveryServiceModule()
     process.env.APISMART_API_KEY = 'apismart-secret'

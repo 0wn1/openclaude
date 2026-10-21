@@ -36,6 +36,7 @@ import {
   isCanonicalConcentrateInferenceBaseUrl,
   isCanonicalLlmtrInferenceBaseUrl,
   isCanonicalCommandcodeInferenceBaseUrl,
+  isCanonicalMergeGatewayInferenceBaseUrl,
   isGmiCloudBaseUrl,
   resolveActiveRouteIdFromEnv,
 } from '../integrations/routeMetadata.js'
@@ -416,6 +417,9 @@ export function applyProviderFlag(
                         : process.env.OPENAI_API_KEY !== undefined &&
                           process.env.OPENAI_API_KEY === process.env.LLMTR_API_KEY
                         ? 'llmtr'
+                        : process.env.OPENAI_API_KEY !== undefined &&
+                          process.env.OPENAI_API_KEY === process.env.MERGE_GATEWAY_API_KEY
+                        ? 'merge-gateway'
                         : process.env.OPENAI_API_KEY !== undefined &&
                           (process.env.OPENAI_API_KEY === process.env.CMD_API_KEY ||
                             process.env.OPENAI_API_KEY ===
@@ -933,6 +937,8 @@ export function applyProviderFlag(
       process.env.CLAUDE_CODE_USE_OPENAI = '1'
       applyOpenAIBaseUrlDefault(provider, defaultBaseUrl)
       if (
+        (provider === 'merge-gateway' &&
+          isCanonicalMergeGatewayInferenceBaseUrl(getConfiguredOpenAIBaseUrl())) ||
         (provider === 'llmtr' &&
           isCanonicalLlmtrInferenceBaseUrl(getConfiguredOpenAIBaseUrl())) ||
         (provider === 'commandcode' &&

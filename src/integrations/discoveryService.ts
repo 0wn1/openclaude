@@ -16,6 +16,7 @@ import { filterAvailableCatalogEntries } from './registry.js'
 import {
   getRouteDescriptor,
   isCanonicalApismartInferenceBaseUrl,
+  isCanonicalMergeGatewayInferenceBaseUrl,
   isCanonicalXaiInferenceBaseUrl,
   resolveActiveRouteIdFromEnv,
   resolveRouteCredentialValue,
@@ -26,6 +27,7 @@ import type {
 } from '../utils/providerDiscovery.js'
 import {
   fetchOpenAICompatibleModelsRaw,
+  fetchMergeGatewayModelsRaw,
   listOpenAICompatibleModels,
   probeOllamaModelCatalog,
   probeAtomicChatReadiness,
@@ -217,8 +219,10 @@ function getRouteDiscoveryApiKey(
   // URL. Apply the same exact inference-endpoint boundary used by requests and
   // profiles before considering either a caller-provided or ambient key.
   if (
-    routeId === 'apismart' &&
-    !isCanonicalApismartInferenceBaseUrl(baseUrl)
+    (routeId === 'apismart' &&
+      !isCanonicalApismartInferenceBaseUrl(baseUrl)) ||
+    (routeId === 'merge-gateway' &&
+      !isCanonicalMergeGatewayInferenceBaseUrl(baseUrl))
   ) {
     return undefined
   }
@@ -427,10 +431,14 @@ async function runDiscovery(
 
     case 'openai-compatible': {
       if (discovery.mapModel) {
-        const rawModels = await fetchOpenAICompatibleModelsRaw({
+        const fetchModels = routeId === 'merge-gateway'
+          ? fetchMergeGatewayModelsRaw
+          : fetchOpenAICompatibleModelsRaw
+        const rawModels = await fetchModels({
           baseUrl: getRouteBaseUrl(routeId, options),
           apiKey: getRouteDiscoveryApiKey(routeId, options),
           headers: getRouteDiscoveryHeaders(routeId, options),
+          path: discovery.path,
         })
         if (rawModels === null) {
           return null
@@ -449,6 +457,7 @@ async function runDiscovery(
         baseUrl: getRouteBaseUrl(routeId, options),
         apiKey: getRouteDiscoveryApiKey(routeId, options),
         headers: getRouteDiscoveryHeaders(routeId, options),
+        path: discovery.path,
       })
       return models?.map(model => toDiscoveredModelEntry(model)) ?? null
     }
