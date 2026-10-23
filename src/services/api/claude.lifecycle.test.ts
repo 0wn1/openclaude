@@ -22,6 +22,7 @@ import { QueryLifecycleOperationTracker } from '../../utils/queryLifecycle.js'
 import {
   __getInterruptionTraceSnapshotForTests,
   __resetInterruptionTraceForTests,
+  __waitForInterruptionTraceFlushForTests,
 } from '../../utils/interruptionTrace.js'
 import { asSystemPrompt } from '../../utils/systemPromptType.js'
 import { getClaudeAIOAuthTokens } from '../../utils/auth.js'
@@ -509,8 +510,18 @@ beforeEach(async () => {
   getClaudeAIOAuthTokens.cache?.clear?.()
 })
 
-afterEach(() => {
+afterEach(async () => {
+  let flushTimeout: ReturnType<typeof setTimeout> | undefined
   try {
+    // Match graceful shutdown's budget so a stuck append cannot hold the lock.
+    await Promise.race([
+      __waitForInterruptionTraceFlushForTests(),
+      new Promise<void>(resolve => {
+        flushTimeout = setTimeout(resolve, 500)
+      }),
+    ])
+    // Trace-enabled cases reset their snapshots before use. Resetting here
+    // makes Bun 1.3.13 crash while running subsequent isolated test files.
     for (const key of envKeys) {
       if (originalEnv[key] === undefined) {
         delete process.env[key]
@@ -540,6 +551,7 @@ afterEach(() => {
       fixturesRoot = undefined
     }
   } finally {
+    if (flushTimeout !== undefined) clearTimeout(flushTimeout)
     releaseSharedMutationLock()
   }
 })
