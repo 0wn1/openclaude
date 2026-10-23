@@ -21,6 +21,15 @@ import type {
 const realSessionStorage = {
   ...await import(`../../utils/sessionStorage.js?real=${Date.now()}-${Math.random()}`),
 }
+const realGoalPersistence = {
+  ...await import(`../../services/goal/persistence.js?real=${Date.now()}-${Math.random()}`),
+}
+const realGetWorktreePaths = {
+  ...await import(`../../utils/getWorktreePaths.js?real=${Date.now()}-${Math.random()}`),
+}
+const realReplayIndex = {
+  ...await import(`../../utils/replayIndex.js?real=${Date.now()}-${Math.random()}`),
+}
 
 type OnDoneArgs = Parameters<LocalJSXCommandOnDone>
 
@@ -194,6 +203,8 @@ describe('/resume and /continue unified command', () => {
       searchSessionsByCustomTitle: searchSessionsByCustomTitleMock,
     }))
     mock.module('../../utils/replayIndex.js', () => ({
+      // Bun caches the initial mock's export names, including after restoration.
+      ...realReplayIndex,
       loadReplayIndex: loadReplayIndexMock,
     }))
   })
@@ -201,6 +212,9 @@ describe('/resume and /continue unified command', () => {
   afterEach(() => {
     mock.restore()
     mock.module('../../utils/sessionStorage.js', () => realSessionStorage)
+    mock.module('../../services/goal/persistence.js', () => realGoalPersistence)
+    mock.module('../../utils/getWorktreePaths.js', () => realGetWorktreePaths)
+    mock.module('../../utils/replayIndex.js', () => realReplayIndex)
   })
 
   test('/continue continues an active goal', async () => {
