@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { afterAll, afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import type {
   BetaMessage,
   BetaMessageStreamParams,
@@ -24,6 +24,7 @@ import {
   __getInterruptionTraceSnapshotForTests,
   __resetInterruptionTraceForTests,
   __waitForInterruptionTraceFlushForTests,
+  isInterruptionTraceEnabled,
 } from '../../utils/interruptionTrace.js'
 import { asSystemPrompt } from '../../utils/systemPromptType.js'
 import { getClaudeAIOAuthTokens } from '../../utils/auth.js'
@@ -106,6 +107,9 @@ const hadSavedMacro = Object.hasOwn(globalThis, 'MACRO')
 const savedMacro = (globalThis as Record<string, unknown>).MACRO
 const originalNodeEnv = process.env.NODE_ENV
 let fixturesRoot: string | undefined
+const unexpectedInterruptionTraces: ReturnType<
+  typeof __getInterruptionTraceSnapshotForTests
+>[] = []
 
 type FetchOverride = NonNullable<Options['fetchOverride']>
 type LifecycleSnapshot = ReturnType<QueryLifecycleOperationTracker['snapshot']>
@@ -523,8 +527,12 @@ afterEach(async () => {
         flushTimeout = setTimeout(resolve, 500)
       }),
     ])
-    // Trace-enabled cases reset their snapshots before use. Resetting here
-    // makes Bun 1.3.13 crash while running subsequent isolated test files.
+    // Only cases that enabled tracing may leave entries before cleanup.
+    if (!isInterruptionTraceEnabled()) {
+      const trace = __getInterruptionTraceSnapshotForTests()
+      if (trace.length > 0) unexpectedInterruptionTraces.push(trace)
+    }
+    __resetInterruptionTraceForTests()
     for (const key of envKeys) {
       if (originalEnv[key] === undefined) {
         delete process.env[key]
@@ -558,6 +566,10 @@ afterEach(async () => {
     if (flushTimeout !== undefined) clearTimeout(flushTimeout)
     releaseSharedMutationLock()
   }
+})
+
+afterAll(() => {
+  expect(unexpectedInterruptionTraces).toEqual([])
 })
 
 if (runInProviderIsolatedChild) {
