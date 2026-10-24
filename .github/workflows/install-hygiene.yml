@@ -13,12 +13,24 @@
 name: Install hygiene
 
 on:
+  pull_request:
+    paths:
+      - 'package.json'
+      - 'bun.lock'
+      - 'src/utils/imageResizer.native.test.ts'
+      - '.github/workflows/install-hygiene.yml'
   schedule:
     - cron: '17 6 * * *' # daily, off the top-of-hour rush
   workflow_dispatch:
 
 permissions:
   contents: read
+
+# Supersede stale runs for the same pull request. Scheduled and manual runs
+# get a per-run group and are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   verify-published-install:
@@ -47,6 +59,9 @@ jobs:
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
+
+      - name: Verify native image processing
+        run: bun test src/utils/imageResizer.native.test.ts
 
       - name: Verify published package installs clean
         run: bun run scripts/verify-clean-install.ts --published
