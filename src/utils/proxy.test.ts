@@ -132,9 +132,11 @@ describe('runtime CA certificates through CONNECT', () => {
       clearMTLSCache()
       clearProxyCache()
       configureGlobalAgents() // Eject the test's global axios interceptor.
+      const directDispatcher = getGlobalDispatcher()
       Object.assign(axios.defaults, defaults)
       setGlobalDispatcher(dispatcher)
-      if (testDispatcher !== dispatcher) await testDispatcher.close?.()
+      if (testDispatcher !== dispatcher) await testDispatcher.destroy?.()
+      if (directDispatcher !== dispatcher) await directDispatcher.destroy?.()
       restoreEnv()
       clearCACertsCache()
       clearMTLSCache()

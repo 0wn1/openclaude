@@ -258,6 +258,10 @@ export function createAxiosInstance(
   return instance
 }
 
+function getProxyAgentCacheKey(uri: string): string {
+  return JSON.stringify([uri, getNoProxy()])
+}
+
 /**
  * Get or create a proxy agent cached by URI and effective NO_PROXY value.
  * Include the bypass list because wildcard normalization pins it on the agent.
@@ -306,7 +310,7 @@ export const getProxyAgent = memoize((uri: string): undici.Dispatcher => {
   return typeof Bun === 'undefined'
     ? new undiciMod.Dispatcher1Wrapper(agent)
     : agent
-}, (uri: string) => JSON.stringify([uri, getNoProxy()]))
+}, getProxyAgentCacheKey)
 
 /**
  * Get an HTTP agent configured for WebSocket proxy support
@@ -395,6 +399,11 @@ export function getProxyFetchOptions(opts?: { forAnthropicAPI?: boolean }): {
  * This ensures all HTTP requests use the proxy and/or mTLS if configured
  */
 let proxyInterceptorId: number | undefined
+let installedDispatcher: undici.Dispatcher | undefined
+let installedProxyCacheKey: string | undefined
+let installedTLSDispatcher = false
+let installedTLSAgent: ReturnType<typeof getMTLSAgent>
+let ownsInstalledDispatcher = false
 
 export function configureGlobalAgents(): void {
   const proxyUrl = getProxyUrl()
@@ -438,25 +447,48 @@ export function configureGlobalAgents(): void {
       }
       return config
     })
-
-    // Set global dispatcher that now respects NO_PROXY via EnvHttpProxyAgent
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    ;(require('undici') as typeof undici).setGlobalDispatcher(
-      getProxyAgent(proxyUrl),
-    )
-  } else if (mtlsAgent) {
-    // No proxy but mTLS is configured
+  } else {
     axios.defaults.httpsAgent = mtlsAgent
+  }
 
-    // Set undici global dispatcher with mTLS
-    const mtlsOptions = getTLSFetchOptions()
-    if (mtlsOptions.dispatcher) {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      ;(require('undici') as typeof undici).setGlobalDispatcher(
-        mtlsOptions.dispatcher,
-      )
+  // Keep the ordinary direct path lazy. Only clear our proxy/TLS installation
+  // while it is still global; another caller may have installed a replacement.
+  if (!proxyUrl && !mtlsAgent && installedProxyCacheKey === undefined && !installedTLSDispatcher) return
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const undiciMod = require('undici') as typeof undici
+  if (!proxyUrl && !mtlsAgent && undiciMod.getGlobalDispatcher() !== installedDispatcher) return
+
+  // Reuse our TLS installation while its source configuration remains cached.
+  const cachedTLSDispatcher = !proxyUrl && mtlsAgent && installedTLSDispatcher &&
+    installedTLSAgent === mtlsAgent ? installedDispatcher : undefined
+  const tlsOptions = proxyUrl || cachedTLSDispatcher ? undefined : getTLSFetchOptions()
+  const dispatcher = proxyUrl ? getProxyAgent(proxyUrl) :
+    cachedTLSDispatcher ?? tlsOptions?.dispatcher ?? new undiciMod.Agent({ connect: tlsOptions?.tls })
+  undiciMod.setGlobalDispatcher(dispatcher)
+
+  if (installedDispatcher && installedDispatcher !== dispatcher) {
+    // Evict only the retired proxy, leaving the active dispatcher cached.
+    if (installedProxyCacheKey !== undefined &&
+        getProxyAgent.cache.get(installedProxyCacheKey) === installedDispatcher) {
+      getProxyAgent.cache.delete(installedProxyCacheKey)
+    }
+    // Proxy dispatchers are shared with callers that can retain fetch options.
+    // Eviction does not prove those references are gone, so leave them open.
+    if (ownsInstalledDispatcher || (installedTLSDispatcher && installedTLSAgent !== mtlsAgent)) {
+      try {
+        // Graceful close lets in-flight requests finish without blocking updates.
+        void installedDispatcher.close().catch(() => {})
+      } catch {
+        // Dispatcher cleanup is best effort.
+      }
     }
   }
+  installedDispatcher = dispatcher
+  installedProxyCacheKey = proxyUrl ? getProxyAgentCacheKey(proxyUrl) : undefined
+  installedTLSDispatcher = !proxyUrl && !!mtlsAgent
+  installedTLSAgent = mtlsAgent
+  // Only the plain direct dispatcher is private; proxy options are handed out.
+  ownsInstalledDispatcher = !proxyUrl && !mtlsAgent
 }
 
 /**
