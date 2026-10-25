@@ -1,4 +1,7 @@
+import type Anthropic from '@anthropic-ai/sdk'
 import { APIError } from '@anthropic-ai/sdk'
+import { snapshotEnv } from '../../../test/envSnapshot.js'
+import { CannotRetryError, withRetry } from '../withRetry.js'
 import { afterEach, beforeEach, expect, jest, mock, test } from 'bun:test'
 import { acquireSharedMutationLock, releaseSharedMutationLock } from '../../../test/sharedMutationLock.js'
 import { asMockFetch } from '../../../test/typedMocks.js'
@@ -6,6 +9,7 @@ import { _clearRegistryForTesting, ensureIntegrationsLoaded, registerGateway } f
 import { applyProviderFlag } from '../../../utils/providerFlag.ts'
 import { applyProviderProfileToProcessEnv } from '../../../utils/providerProfiles.ts'
 import {
+  categorizeRetryableAPIError,
   getAssistantMessageFromError,
   OPENCODE_GO_FREE_LIMIT_ERROR_MESSAGE,
 } from '../errors.ts'
@@ -874,6 +878,202 @@ test('OPENAI_API_KEYS rotates to the next key on rate-limit failure', async () =
   })
 
   expect(authorizations).toEqual(['Bearer key-a', 'Bearer key-b'])
+})
+
+test.each([
+  { body: 'Too many requests, try again in 30s', retries: true },
+  { body: 'Rate limit exceeded for this API key', retries: true },
+  { body: 'Rate limit exceeded for this API key, streaming is disabled', retries: true },
+  { body: 'Rate limit exceeded for this API key, currently streaming is disabled', retries: true },
+  { body: 'Rate limit exceeded for this OAuth token', retries: true },
+  { body: 'Too many requests; no tokens remaining in the rate limit bucket', retries: true },
+  { body: 'Too many requests; empty token bucket', retries: true },
+  { body: 'Too many requests; no tokens found in the rate limit bucket', retries: true },
+  { body: 'Rate limit exceeded for this API key: bad gateway', retries: true },
+  { body: 'Rate limit exceeded for this API key: upstream response is empty', retries: true },
+  { body: 'Rate limit exceeded for this API key, bad gateway', retries: true },
+  { body: 'Rate limit exceeded for this API key, empty response received', retries: true },
+  { body: 'Token is invalid; too many requests', retries: false },
+  { body: 'No API key was provided; too many requests', retries: false },
+  { body: 'No valid API key found; too many requests', retries: false },
+  { body: 'No API key found; too many requests', retries: false },
+  { body: 'No token provided; rate limit exceeded', retries: false },
+  { body: 'API key is empty; too many requests', retries: false },
+  { body: '{"error":{"code":"bad_api_key","message":"Too many requests"}}', retries: false },
+  { body: 'Too many requests; your API key is no longer valid', retries: false },
+  { body: 'Too many requests; your API key does not exist', retries: false },
+  { body: 'Too many requests; API key, which is no longer valid', retries: false },
+  { body: 'API key, now empty; too many requests', retries: false },
+  { body: 'Account disabled; too many requests', retries: false },
+  { body: '{"error":{"code":"account_disabled","message":"Too many requests"}}', retries: false },
+  { body: 'Key is invalid; too many requests', retries: false },
+  { body: 'API key has been permanently disabled; too many requests', retries: false },
+  { body: 'Token has been permanently disabled; too many requests', retries: false },
+  { body: 'Rate limit exceeded; API key is invalid', retries: false },
+  { body: 'Rate limit exceeded; API key\nis invalid', retries: false },
+  { body: '{"error":{"code":"rate_limit_exceeded"}}', retries: true },
+  { body: '', retries: false },
+  { body: 'Try again later', retries: false },
+  { body: 'Forbidden: too many requests', retries: false },
+  { body: 'Quota exceeded; too many requests', retries: false },
+  { body: 'Too many requests', retries: false, noRetry: true },
+  { body: '{"message":"Too many requests","type":"overloaded_error"}', retries: true },
+  { body: '{"message":"Too many requests","type":"overloaded_error"}', retries: false, noRetry: true },
+  { body: 'Too many requests: {"type":"overloaded_error"}', retries: false, noRetry: true },
+  { body: 'Too many requests: {"type":"overloaded_error"}', retries: false, noRetry: true, remote: true },
+  { body: 'Too many requests', retries: false, noRetry: true, remote: true },
+  { body: '{"error":{"code":"rate_limit_exceeded"}}', retries: false, noRetry: true, remote: true },
+  { body: 'Too many requests', retries: true, remote: true },
+  { body: 'Too many requests', retries: true, baseUrl: 'https://billing.example.com/v1' },
+  { body: '{"error":{"code":"rate_limit_exceeded"}}', retries: true, baseUrl: 'https://billing.example.com/v1' },
+  { body: 'Too many requests', retries: false, noRetry: true, baseUrl: 'https://billing.example.com/v1' },
+  { body: 'Quota exceeded; too many requests', retries: false, baseUrl: 'https://billing.example.com/v1' },
+  { body: 'Too many requests', retries: true, status: 429, baseUrl: 'https://billing.example.com/v1' },
+  { body: 'Billing required; too many requests', retries: false, status: 429, baseUrl: 'https://billing.example.com/v1' },
+])('throttle responses through the shim and retry loop: %j', async ({ body, retries, noRetry, remote, baseUrl, status = 403 }) => {
+  const restoreRetryEnv = snapshotEnv(['OPENCLAUDE_RETRY_DELAY_MS', 'CLAUDE_CODE_USE_OPENAI', 'CLAUDE_CODE_REMOTE', 'OPENAI_BASE_URL'])
+  if (baseUrl) process.env.OPENAI_BASE_URL = baseUrl
+  if (remote) process.env.CLAUDE_CODE_REMOTE = '1'
+  else delete process.env.CLAUDE_CODE_REMOTE
+  process.env.OPENCLAUDE_RETRY_DELAY_MS = '1'
+  process.env.CLAUDE_CODE_USE_OPENAI = '1'
+  let attempts = 0
+  globalThis.fetch = asMockFetch(mock(async () => {
+    attempts++
+    return attempts === 1
+      ? new Response(body, {
+          status,
+          headers: noRetry ? { 'x-should-retry': 'false' } : {},
+        })
+      : makeChatCompletionResponse('gpt-5.5')
+  }))
+  const client = createOpenAIShimClient({}) as Anthropic
+  const countdowns: unknown[] = []
+  const retryCategories: string[] = []
+  let caught: unknown
+  let result: unknown
+  try {
+    const generator = withRetry(
+      async () => client,
+      api => api.beta.messages.create({
+        model: 'gpt-5.5',
+        messages: [{ role: 'user', content: 'hello' }],
+        max_tokens: 32,
+        stream: false,
+      }),
+      { maxRetries: 2, model: 'gpt-5.5', thinkingConfig: { type: 'disabled' } },
+    )
+    while (true) {
+      const next = await generator.next()
+      if (next.done) {
+        result = next.value
+        break
+      }
+      countdowns.push(next.value)
+      // QueryEngine uses this same projection for public SDK api_retry events.
+      retryCategories.push(categorizeRetryableAPIError(next.value.error))
+    }
+  } catch (error) {
+    caught = error
+  } finally {
+    restoreRetryEnv()
+  }
+  expect(attempts).toBe(retries ? 2 : 1)
+  expect(retryCategories).toEqual(retries ? ['rate_limit'] : [])
+  if (retries) {
+    expect(caught).toBeUndefined()
+    expect(result).toMatchObject({ content: [{ type: 'text', text: 'ok' }] })
+    expect(countdowns).toEqual([expect.objectContaining({
+      type: 'system', subtype: 'api_error', retryAttempt: 1, maxRetries: 2,
+    })])
+  } else {
+    expect(caught).toBeInstanceOf(CannotRetryError)
+    expect(countdowns).toEqual([])
+    if (/account|key|token/i.test(body)) {
+      const message = getAssistantMessageFromError((caught as CannotRetryError).originalError, 'gpt-5.5')
+      expect(JSON.stringify(message)).toContain('Authentication failed')
+      expect(JSON.stringify(message)).not.toContain('Provider rate limit reached')
+    }
+  }
+})
+
+test.each([
+  'Too many requests',
+  '{"error":{"code":"rate_limit_exceeded","message":"Too many requests"}}',
+])('throttle-403 exhausts the bounded retry budget with rate-limit guidance: %s', async body => {
+  const restoreRetryEnv = snapshotEnv(['OPENCLAUDE_RETRY_DELAY_MS', 'CLAUDE_CODE_USE_OPENAI'])
+  process.env.OPENCLAUDE_RETRY_DELAY_MS = '1'
+  process.env.CLAUDE_CODE_USE_OPENAI = '1'
+  let attempts = 0
+  globalThis.fetch = asMockFetch(mock(async () => {
+    attempts++
+    return new Response(body, { status: 403, headers: { 'request-id': 'throttle-request' } })
+  }))
+  const client = createOpenAIShimClient({}) as Anthropic
+  let caught: unknown
+  try {
+    for await (const _ of withRetry(
+      async () => client,
+      api => api.beta.messages.create({
+        model: 'gpt-5.5', messages: [{ role: 'user', content: 'hello' }], max_tokens: 32,
+      }),
+      { maxRetries: 2, model: 'gpt-5.5', thinkingConfig: { type: 'disabled' } },
+    )) { /* drain countdowns */ }
+  } catch (error) {
+    caught = error
+  } finally {
+    restoreRetryEnv()
+  }
+  expect(attempts).toBe(3)
+  expect(caught).toBeInstanceOf(CannotRetryError)
+  const originalError = (caught as CannotRetryError).originalError as APIError
+  expect(originalError.status).toBe(403)
+  expect(originalError.requestID).toBe('throttle-request')
+  if (body.startsWith('{')) expect(originalError.error).toEqual(JSON.parse(body))
+  const message = getAssistantMessageFromError(originalError, 'gpt-5.5')
+  expect(JSON.stringify(message)).toContain('Provider rate limit reached')
+  expect(JSON.stringify(message)).not.toContain('Authentication failed')
+})
+
+test.each([
+  { body: 'Rate limit exceeded for this OAuth token', recoverable: true },
+  { body: 'Rate limit exceeded for this API key, bad gateway', recoverable: true },
+  { body: 'Account disabled; too many requests', recoverable: false },
+  { body: 'No API key was provided; too many requests', recoverable: false },
+  { body: 'No valid API key found; too many requests', recoverable: false },
+  { body: 'Too many requests; API key, which is no longer valid', recoverable: false },
+  { body: '{"error":{"code":"bad_api_key","message":"Too many requests"}}', recoverable: false },
+  { body: '{"error":{"code":"account_deactivated","message":"Too many requests"}}', recoverable: false },
+])('throttle-403 credential recovery follows fault precedence: %j', async ({ body, recoverable }) => {
+  const restorePoolEnv = snapshotEnv(['CLAUDE_CODE_USE_OPENAI', 'OPENAI_API_KEYS', 'OPENAI_API_KEY'])
+  try {
+    jest.useFakeTimers()
+    process.env.CLAUDE_CODE_USE_OPENAI = '1'
+    process.env.OPENAI_API_KEYS = 'key-a,key-b'
+    delete process.env.OPENAI_API_KEY
+    const authorizations: Array<string | null> = []
+    globalThis.fetch = asMockFetch(mock(async (_input, init) => {
+      const headers = new Headers(init?.headers)
+      authorizations.push(headers.get('authorization'))
+      return authorizations.length === 1
+        ? new Response(body, { status: 403 })
+        : makeChatCompletionResponse('gpt-5.5')
+    }))
+    const client = createOpenAIShimClient({}) as Anthropic
+    const request = () => client.beta.messages.create({
+      model: 'gpt-5.5', messages: [{ role: 'user', content: 'hello' }], max_tokens: 32,
+    })
+    await request()
+    await request()
+    expect(authorizations).toEqual(['Bearer key-a', 'Bearer key-b', 'Bearer key-b'])
+    jest.advanceTimersByTime(30_001)
+    await request()
+    expect(authorizations).toEqual([
+      'Bearer key-a', 'Bearer key-b', 'Bearer key-b', recoverable ? 'Bearer key-a' : 'Bearer key-b',
+    ])
+  } finally {
+    restorePoolEnv()
+  }
 })
 
 test('GitHub 429 cools the active pooled credential before retrying', async () => {
