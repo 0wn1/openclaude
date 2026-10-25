@@ -3448,6 +3448,30 @@ describe('applyActiveProviderProfileFromConfig', () => {
     expect(process.env.OPENAI_MODEL).toBe('gpt-4o')
   })
 
+  test.each(['minimax-m3-free', 'minimax-m3.1-flash-free'])('applies saved retired Zen model %s without rewriting the configured model', async savedModel => {
+    const { _setSavedModelOverrideForTesting, applyActiveProviderProfileFromConfig } =
+      await importFreshProviderProfileModules()
+    const profile = buildProfile({
+      id: 'saved_zen',
+      provider: 'opencode',
+      baseUrl: 'https://opencode.ai/zen/v1',
+      model: 'gpt-5.4',
+    })
+    _setSavedModelOverrideForTesting(savedModel)
+    try {
+      const applied = applyActiveProviderProfileFromConfig({
+        ...createMockConfigState(),
+        providerProfiles: [profile],
+        activeProviderProfileId: profile.id,
+      })
+      expect(applied?.id).toBe(profile.id)
+      expect(process.env.OPENAI_MODEL).toBe(savedModel)
+      expect(profile.model).toBe('gpt-5.4')
+    } finally {
+      _setSavedModelOverrideForTesting(undefined)
+    }
+  })
+
   test.each(['', '?reasoning=high', '?thinking=disabled&reasoning=high'])(
     'preserves context limits for configured and saved models across profile rehydration (%j)',
     async query => {
@@ -3941,7 +3965,7 @@ describe('getProviderPresetDefaults', () => {
     expect(defaults.requiresApiKey).toBe(true)
   })
 
-  test('minimax preset defaults to MiniMax M3', async () => {
+  test('minimax preset defaults to MiniMax M3.1 Flash', async () => {
     const { getProviderPresetDefaults } = await importFreshProviderProfileModules()
 
     const defaults = getProviderPresetDefaults('minimax')
@@ -3949,7 +3973,7 @@ describe('getProviderPresetDefaults', () => {
     expect(defaults.provider).toBe('minimax')
     expect(defaults.name).toBe('MiniMax')
     expect(defaults.baseUrl).toBe('https://api.minimax.io/anthropic')
-    expect(defaults.model).toBe('MiniMax-M3')
+    expect(defaults.model).toBe('MiniMax-M3.1-Flash')
     expect(defaults.requiresApiKey).toBe(true)
   })
 
@@ -6124,6 +6148,31 @@ describe('getProfileModelOptions', () => {
     ])
   })
 
+  test.each([
+    ['minimax', 'https://api.minimax.io/anthropic', 'MiniMax-M2.7'],
+    ['opencode', 'https://opencode.ai/zen/v1', 'minimax-m3-free'],
+    ['opencode', 'https://opencode.ai/zen/v1', 'minimax-m3.1-flash-free'],
+  ])('%s at %s keeps saved %s while filtering its retired suggestions', async (provider, baseUrl, savedModel) => {
+    const { getProfileModelOptions } = await importFreshProviderProfileModules()
+    mockConfigState = {
+      ...createMockConfigState(),
+      openaiAdditionalModelOptionsCacheByProfile: {
+        provider_test: ['MiniMax-M2.5', 'MiniMax-M2.7', 'minimax-m3-free', 'minimax-m3.1-flash-free', 'MiniMax-M3.1-Flash', 'MiniMax-M3', 'MiniMax-Vision-01', 'gpt-4o'].map(value => ({ value, label: value, description: 'Discovered from API' })),
+      },
+    }
+    const profile = buildProfile({
+      id: 'provider_test', provider, baseUrl,
+      model: `${savedModel}, custom-minimax`,
+    })
+    expect(getProfileModelOptions(profile).map(option => option.value)).toEqual([
+      savedModel, 'custom-minimax',
+      ...(provider === 'opencode' ? ['MiniMax-M2.5', 'MiniMax-M2.7'] : []),
+      'MiniMax-M3.1-Flash', 'MiniMax-M3', 'MiniMax-Vision-01', 'gpt-4o',
+    ])
+    expect(profile.model).toBe(`${savedModel}, custom-minimax`)
+    expect(mockConfigState.openaiAdditionalModelOptionsCacheByProfile?.provider_test?.[0]).toMatchObject({ value: 'MiniMax-M2.5' })
+  })
+
   test('returns empty array for empty model field', async () => {
     const { getProfileModelOptions } =
       await importFreshProviderProfileModules()
@@ -6140,6 +6189,50 @@ describe('getProfileModelOptions', () => {
 })
 
 describe('setActiveProviderProfile model cache', () => {
+  test.each([
+    ['ollama', 'http://localhost:11434/v1'],
+    ['ollama', 'https://ollama-proxy.example/v1'],
+    ['lmstudio', 'http://localhost:1234/v1'],
+    ['lmstudio', 'https://lmstudio-proxy.example/v1'],
+    ['atomic-chat', 'http://127.0.0.1:1337/v1'],
+    ['custom', 'http://localhost:8080/v1'],
+    ['opencode', 'https://opencode.ai/zen/v1'],
+    ['opencode-go', 'https://opencode.ai/zen/go/v1'],
+    ['openrouter', 'https://openrouter.ai/api/v1'],
+    ['custom', 'https://models.example/v1'],
+  ] as const)('activation preserves advertised models for %s at %s', async (provider, baseUrl) => {
+    const { setActiveProviderProfile, getActiveOpenAIModelOptionsCache } = await importFreshProviderProfileModules()
+    const models = ['minimax-m3.1-flash:cloud', 'minimax-m3:cloud', 'minimax-m2.7:cloud', 'minimaxai/minimax-m2.7', 'minimax-m3.1-flash-q4_k_m', 'minimax-m2.5', 'minimax-m2.7']
+    const profile = buildProfile({ id: 'local_models', provider, baseUrl, model: 'qwen3:latest' })
+    mockConfigState = {
+      ...createMockConfigState(),
+      providerProfiles: [profile],
+      openaiAdditionalModelOptionsCacheByProfile: {
+        [profile.id]: models.map(value => ({ value, label: value, description: 'Discovered from Ollama' })),
+      },
+    }
+    expect(setActiveProviderProfile(profile.id, { configDir: testConfigDir ?? undefined })?.id).toBe(profile.id)
+    expect(getActiveOpenAIModelOptionsCache().map(option => option.value)).toEqual(['qwen3:latest', ...models])
+    expect(mockConfigState.openaiAdditionalModelOptionsCacheByProfile[profile.id]?.map(option => (option as { value: string }).value)).toEqual(['qwen3:latest', ...models])
+    expect(profile.model).toBe('qwen3:latest')
+  })
+
+  test('activation ignores malformed persisted option values before filtering', async () => {
+    const { setActiveProviderProfile, getActiveOpenAIModelOptionsCache } = await importFreshProviderProfileModules()
+    const profile = buildProfile({ id: 'malformed_options', model: 'gpt-4o' })
+    mockConfigState = {
+      ...createMockConfigState(),
+      providerProfiles: [profile],
+      // Persisted JSON bypasses the ModelOption type; retain the existing
+      // non-string guard, including records whose value is absent.
+      openaiAdditionalModelOptionsCacheByProfile: {
+        [profile.id]: JSON.parse('[{},{"value":42},{"value":true},{"value":{}},{"value":[]},{"value":null},{"value":" "},{"value":"gpt-4.1","label":"gpt-4.1","description":"Discovered"}]'),
+      },
+    }
+    expect(setActiveProviderProfile(profile.id, { configDir: testConfigDir ?? undefined })?.id).toBe(profile.id)
+    expect(getActiveOpenAIModelOptionsCache().map(option => option.value)).toEqual(['gpt-4o', 'gpt-4.1'])
+  })
+
   test('populates model cache with all models from multi-model profile on activation', async () => {
     const {
       setActiveProviderProfile,

@@ -474,7 +474,7 @@ export const PROVIDER_PRESET_MANIFEST = [
     "routeId": "opencode",
     "vendorId": "openai",
     "gatewayId": "opencode",
-    "description": "OpenCode Zen - pay-as-you-go AI gateway (48 models)",
+    "description": "OpenCode Zen - pay-as-you-go AI gateway",
     "apiKeyEnvVars": [
       "OPENCODE_API_KEY"
     ],
