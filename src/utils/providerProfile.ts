@@ -2315,6 +2315,7 @@ export async function buildLaunchEnv(options: {
     'FIREWORKS_API_KEY',
     'LONGCAT_API_KEY',
     'AIMLAPI_API_KEY',
+    'MINIMAX_API_KEY',
     'MIMO_API_KEY',
     'NVIDIA_API_KEY',
     'VENICE_API_KEY',
@@ -2324,6 +2325,21 @@ export async function buildLaunchEnv(options: {
     // actually targets the aimlapi route — otherwise an ambient or persisted
     // AI/ML key would leak into an unrelated OpenAI-compatible session.
     if (dedicatedKey === 'AIMLAPI_API_KEY' && effectiveOpenAIRouteId !== 'aimlapi') {
+      continue
+    }
+    // These aliases also affect copied-key precedence and provider display.
+    // Admit them only for the selected route, including after a URL override.
+    if (dedicatedKey === 'MINIMAX_API_KEY' && effectiveOpenAIRouteId !== 'minimax') {
+      continue
+    }
+    if (dedicatedKey === 'VENICE_API_KEY' && effectiveOpenAIRouteId !== 'venice') {
+      continue
+    }
+    if (
+      dedicatedKey === 'MIMO_API_KEY' &&
+      effectiveOpenAIRouteId !== 'xiaomi-mimo' &&
+      effectiveOpenAIRouteId !== 'xiaomi-mimo-token'
+    ) {
       continue
     }
     if (dedicatedKey === 'APISMART_API_KEY' && effectiveOpenAIRouteId !== 'apismart') {
