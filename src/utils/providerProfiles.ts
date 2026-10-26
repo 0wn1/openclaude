@@ -1,3 +1,5 @@
+import { getGeminiVertexProjectId, geminiVertexAdcWillResolveProject } from './geminiAuth.js'
+import { isEnvTruthy } from './envUtils.js'
 import { randomBytes } from 'crypto'
 import {
   getAdditionalModelOptionsCacheScope,
@@ -15,6 +17,7 @@ import {
 import type { ModelOption } from './model/modelOptions.js'
 import { isCurrentMiniMaxModelOption } from './model/minimaxCatalog.js'
 import { getPrimaryModel, parseModelList } from './providerModels.js'
+import { PROVIDER_SELECTION_FLAGS } from './providerSelectionFlags.js'
 import {
   buildCompatibilityProcessEnv,
   createProfileFile,
@@ -427,6 +430,8 @@ function sanitizeProfile(profile: ProviderProfile): ProviderProfile | null {
   const id = trimValue(profile.id)
   const name = trimValue(profile.name)
   const provider = trimValue(profile.provider)
+  // Native Vertex is env/CLI-only until its profile setup is implemented.
+  if (provider === 'gemini-vertex') return null
   const baseUrl = normalizeBaseUrl(profile.baseUrl)
   const model = trimValue(profile.model)
   const apiFormat = parseOpenAICompatibleApiFormat(profile.apiFormat)
@@ -665,15 +670,7 @@ export function hasProviderProfiles(config = getGlobalConfig()): boolean {
 function hasProviderSelectionFlags(
   processEnv: NodeJS.ProcessEnv = process.env,
 ): boolean {
-  return (
-    processEnv.CLAUDE_CODE_USE_OPENAI !== undefined ||
-    processEnv.CLAUDE_CODE_USE_GEMINI !== undefined ||
-    processEnv.CLAUDE_CODE_USE_MISTRAL !== undefined ||
-    processEnv.CLAUDE_CODE_USE_GITHUB !== undefined ||
-    processEnv.CLAUDE_CODE_USE_BEDROCK !== undefined ||
-    processEnv.CLAUDE_CODE_USE_VERTEX !== undefined ||
-    processEnv.CLAUDE_CODE_USE_FOUNDRY !== undefined
-  )
+  return PROVIDER_SELECTION_FLAGS.some(flag => processEnv[flag] !== undefined)
 }
 
 /**
@@ -693,6 +690,9 @@ function hasProviderSelectionFlags(
 function hasCompleteProviderSelection(
   processEnv: NodeJS.ProcessEnv = process.env,
 ): boolean {
+  if (isEnvTruthy(processEnv.CLAUDE_CODE_USE_GEMINI_VERTEX)) {
+    return !!getGeminiVertexProjectId(processEnv) || geminiVertexAdcWillResolveProject(processEnv)
+  }
   if (resolveEnvOnlyProviderRouteId(processEnv) !== null) return true
   if (
     trimOrUndefined(processEnv.ANTHROPIC_BASE_URL) !== undefined &&
@@ -1183,6 +1183,7 @@ export function applyProviderProfileToProcessEnv(
   profile: ProviderProfile,
   options?: { primaryModel?: string },
 ): void {
+  delete process.env.CLAUDE_CODE_USE_GEMINI_VERTEX
   const { route, compatibilityMode } = resolveProfileCompatibility(profile.provider)
   const primaryModel = options?.primaryModel ?? getPrimaryModel(profile.model)
   let profileEnv: ProfileEnv

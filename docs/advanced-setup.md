@@ -89,11 +89,45 @@ export GEMINI_API_KEY=...
 export GEMINI_MODEL=gemini-3-flash-preview
 ```
 
+### Gemini on Vertex AI (native)
+
+Use the native Gemini endpoint with an explicit CLI or environment selection:
+
+```bash
+# For global npm installs, install the optional ADC package:
+npm i -g google-auth-library
+gcloud auth application-default login
+export GEMINI_VERTEX_PROJECT=my-gcp-project
+export GEMINI_VERTEX_LOCATION=global
+openclaude --provider gemini-vertex --model gemini-2.5-flash
+```
+
+Alternatively set `CLAUDE_CODE_USE_GEMINI_VERTEX=1` and
+`GEMINI_VERTEX_MODEL=gemini-2.5-flash`. Project aliases are checked in order:
+`GEMINI_VERTEX_PROJECT`, `GOOGLE_CLOUD_PROJECT`, `GCLOUD_PROJECT`,
+`GOOGLE_PROJECT_ID`. ADC may supply the project when none is set. ADC supports
+`GOOGLE_APPLICATION_CREDENTIALS` and the ambient Google credential chain.
+
+For bearer authentication, set `GEMINI_ACCESS_TOKEN` to a Google OAuth access
+token and supply a project. `GEMINI_VERTEX_AUTH_MODE=adc` or `access-token`
+selects the mode explicitly; otherwise a nonblank token selects access-token
+mode and the default is ADC. An explicit `--model` or session `/model`
+overrides `GEMINI_VERTEX_MODEL`. Location defaults to `global`;
+`gemini-3.5-flash` requires the global endpoint.
+
+This routing stage supports env/CLI selection. Saved native Vertex profiles,
+the `/provider` setup preset, and profile launcher/bootstrap integration are
+deferred to the profile/UI follow-up. Existing saved profiles for other providers
+remain available. Native requests support text, tools, and base64 images/PDFs;
+URL media sources must be supplied as base64. Streaming emits the completed
+response as Anthropic-shaped events.
+
 ### Claude on Vertex AI
 
 The Vertex route uses Anthropic's Claude-on-Vertex API. It is not a general
 Vertex AI Model Garden adapter for Gemini or arbitrary partner models; use the
-Gemini provider for Gemini models and OpenAI-compatible routes for compatible
+native Gemini-on-Vertex route above for Gemini on Vertex, the direct Gemini
+provider for Google AI Studio, and OpenAI-compatible routes for compatible
 third-party gateways.
 
 Authentication uses Google Application Default Credentials through
@@ -405,7 +439,7 @@ missing. Install only what you need:
 | --- | --- | --- |
 | AWS Bedrock | `CLAUDE_CODE_USE_BEDROCK=1` | `npm i -g @anthropic-ai/bedrock-sdk`. Profile-based auth (`~/.aws/credentials`) additionally needs `@aws-sdk/credential-providers` and `@aws-sdk/client-sts`; model listing needs `@aws-sdk/client-bedrock`. Proxy and skip-auth setups may also need `@aws-sdk/credential-provider-node`, `@smithy/node-http-handler`, or `@smithy/core`. The CLI prints the exact missing package if you hit one. |
 | Azure Foundry | `CLAUDE_CODE_USE_FOUNDRY=1` | `npm i -g @anthropic-ai/foundry-sdk @azure/identity` |
-| Claude on Vertex AI / Gemini ADC | `CLAUDE_CODE_USE_VERTEX=1` / Gemini ADC auth | `npm i -g google-auth-library` |
+| Claude on Vertex AI / Gemini ADC / Gemini on Vertex AI | `CLAUDE_CODE_USE_VERTEX=1` / Gemini ADC auth / `CLAUDE_CODE_USE_GEMINI_VERTEX=1` | `npm i -g google-auth-library` |
 | Reading/processing images (clipboard paste, drag-and-drop paths, FileReadTool local decode) | local image decode — **not** pre-encoded URL/base64 passthrough | `npm i -g sharp` (intentionally opt-in; prebuilt releases load it externally only when processing requires it) |
 | Optional error reporting | `SENTRY_DSN` is set | `npm i -g @sentry/node@11.9.0`. Without this package installed, setting `SENTRY_DSN` has no effect and reporting is silently disabled. |
 
@@ -536,7 +570,8 @@ host. Without this variable the behavior is unchanged.
 
 Model env vars are provider-scoped: first-party Anthropic sessions read
 `ANTHROPIC_MODEL`, OpenAI-compatible sessions read `OPENAI_MODEL`, Gemini reads
-`GEMINI_MODEL`, and Mistral reads `MISTRAL_MODEL`. For manual Bedrock, Vertex,
+`GEMINI_MODEL`, Gemini on Vertex reads `GEMINI_VERTEX_MODEL`, and Mistral reads
+`MISTRAL_MODEL`. For manual Bedrock, Claude on Vertex,
 or Foundry launches, select the model with `--model`.
 
 An OpenAI-compatible provider profile's maximum context length applies to every

@@ -6540,3 +6540,36 @@ test('JSON fallback: recovers Tencent HY3 text tool calls into tool_use blocks',
   expect(stopEvent?.delta?.stop_reason).toBe('tool_use')
 })
 // openaiShim test extraction seam 204 end
+
+test.each([
+  ['signed Vertex ID', [`toolu_vertex_k9x_3~~sig~~${'S'.repeat(1700)}`]],
+  ['punctuated IDs', ['call.one', 'call.two']],
+  ['valid IDs', ['call_one', 'call_two']],
+] as const)('sanitizes and pairs distinct tool IDs for the chat/completions wire: %s', async (_label, ids) => {
+  const { __test } = await import('./openaiShim.ts')
+
+  const messages = __test.convertMessages(
+    [
+      {
+        role: 'assistant',
+        content: ids.map(id => ({ type: 'tool_use', id, name: 'Read', input: { file_path: '/tmp/x' } })),
+      },
+      {
+        role: 'user',
+        content: ids.map(id => ({ type: 'tool_result', tool_use_id: id, content: 'done' })),
+      },
+    ],
+    undefined,
+  )
+
+  const assistant = messages.find(m => m.role === 'assistant' && m.tool_calls?.length)
+  const callIds = assistant?.tool_calls?.map(call => call.id) ?? []
+  expect(callIds).toHaveLength(ids.length)
+  expect(new Set(callIds).size).toBe(ids.length)
+  for (const id of callIds) {
+    expect(id.length).toBeLessThanOrEqual(40)
+    expect(id).toMatch(/^[A-Za-z0-9_-]+$/)
+  }
+  expect(messages.filter(m => m.role === 'tool').map(m => m.tool_call_id)).toEqual(callIds)
+  if (ids.every(id => /^[A-Za-z0-9_-]+$/.test(id))) expect(callIds).toEqual([...ids])
+})

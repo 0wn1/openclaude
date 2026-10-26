@@ -1,3 +1,4 @@
+import { getGeminiVertexProjectId, geminiVertexAdcWillResolveProject } from './geminiAuth.js'
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import {
@@ -64,6 +65,7 @@ export const DEFAULT_STARTUP_PROVIDER_ENV_VAR =
   'CLAUDE_CODE_DEFAULT_STARTUP_PROVIDER'
 
 const PROFILE_ENV_KEYS = [
+  'CLAUDE_CODE_USE_GEMINI_VERTEX',
   'CLAUDE_CODE_USE_OPENAI',
   'CLAUDE_CODE_USE_GITHUB',
   'CLAUDE_CODE_USE_GEMINI',
@@ -2557,6 +2559,11 @@ export async function buildStartupEnvFromProfile(options?: {
   readGeminiAccessToken?: () => string | undefined
 }): Promise<NodeJS.ProcessEnv> {
   const processEnv = options?.processEnv ?? process.env
+  // Explicit native selection must precede saved-profile/default adoption.
+  if (
+    isEnvTruthy(processEnv.CLAUDE_CODE_USE_GEMINI_VERTEX) &&
+    (getGeminiVertexProjectId(processEnv) || geminiVertexAdcWillResolveProject(processEnv))
+  ) return processEnv
   const persisted =
     options && 'persisted' in options ? options.persisted : loadProfileFile()
 
@@ -2811,6 +2818,7 @@ export async function applySavedProfileToCurrentSession(options: {
   delete baseEnv.CLAUDE_CODE_USE_OPENAI
   delete baseEnv.CLAUDE_CODE_USE_GITHUB
   delete baseEnv.CLAUDE_CODE_USE_GEMINI
+  delete baseEnv.CLAUDE_CODE_USE_GEMINI_VERTEX
   delete baseEnv.CLAUDE_CODE_USE_MISTRAL
   delete baseEnv.CLAUDE_CODE_USE_BEDROCK
   delete baseEnv.CLAUDE_CODE_USE_VERTEX

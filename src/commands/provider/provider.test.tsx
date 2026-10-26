@@ -815,3 +815,16 @@ test('ProviderWizard hides Codex OAuth while running in bare mode', async () => 
   expect(output).toContain('Set up a provider profile')
   expect(output).not.toContain('Codex OAuth')
 })
+
+test('buildCurrentProviderSummary recognizes the env-only native Vertex route', () => {
+  const summary = buildCurrentProviderSummary({
+    processEnv: {
+      CLAUDE_CODE_USE_GEMINI_VERTEX: '1', GEMINI_VERTEX_PROJECT: 'my-project',
+      GEMINI_VERTEX_LOCATION: 'europe-west4', GEMINI_VERTEX_MODEL: 'gemini-2.5-pro',
+    },
+    persisted: null,
+  })
+  expect(summary.providerLabel).toBe('Google Vertex AI Gemini')
+  expect(summary.modelLabel).toBe('gemini-2.5-pro')
+  expect(summary.endpointLabel).toBe('https://aiplatform.googleapis.com/v1/projects/my-project/locations/europe-west4')
+})

@@ -362,6 +362,7 @@ Advanced and source-build guides:
 | LongCat | `/provider` or env vars | Meituan LongCat OpenAI-compatible API at `https://api.longcat.chat/openai/v1`; uses `LONGCAT_API_KEY` and defaults to `LongCat-2.0` |
 | ClinePass | `/provider` or env vars | AI model gateway with usage limits (5hr, weekly, monthly); uses `CLINE_API_KEY` at `https://api.cline.bot/api/v1` |
 | Gemini | `/provider` or env vars | Supports API key only |
+| Gemini on Vertex AI | `--provider gemini-vertex` or env vars | Native Gemini requests with Google ADC or an access token; [setup](docs/advanced-setup.md#gemini-on-vertex-ai-native) |
 | GitHub Models | `/onboard-github` | Interactive onboarding with saved credentials |
 | Codex OAuth | `/provider` | Opens ChatGPT sign-in in your browser and stores Codex credentials securely |
 | Codex | `/provider` | Uses existing Codex CLI auth, OpenClaude secure storage, or env credentials |

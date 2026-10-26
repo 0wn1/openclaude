@@ -1,3 +1,4 @@
+import { getGeminiVertexModel, getGeminiVertexLocation, getGeminiVertexProjectId, geminiVertexAdcWillResolveProject } from '../../utils/geminiAuth.js'
 import * as React from 'react'
 
 import type { LocalJSXCommandCall, LocalJSXCommandOnDone } from '../../types/command.js'
@@ -290,6 +291,18 @@ export function buildCurrentProviderSummary(options?: {
   const secretSource = processEnv as SecretSourceEnv
   const persisted = options?.persisted ?? loadProfileFile()
   const savedProfileLabel = persisted?.profile ?? 'none'
+
+  if (isEnvTruthy(processEnv.CLAUDE_CODE_USE_GEMINI_VERTEX)) {
+    const project = getGeminiVertexProjectId(processEnv) ??
+      (geminiVertexAdcWillResolveProject(processEnv) ? '<ADC-resolved project>' : '<set GEMINI_VERTEX_PROJECT>')
+    const endpoint = `https://aiplatform.googleapis.com/v1/projects/${project}/locations/${getGeminiVertexLocation(processEnv)}`
+    return {
+      providerLabel: 'Google Vertex AI Gemini',
+      modelLabel: getSafeDisplayValue(getGeminiVertexModel(processEnv), secretSource),
+      endpointLabel: getSafeDisplayValue(endpoint, secretSource),
+      savedProfileLabel,
+    }
+  }
 
   if (isEnvTruthy(processEnv.CLAUDE_CODE_USE_GEMINI)) {
     const geminiMetadata = getProviderPresetUiMetadata('gemini', processEnv)
