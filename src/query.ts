@@ -102,6 +102,7 @@ import {
 } from './utils/messageQueueManager.js'
 import { notifyCommandLifecycle } from './utils/commandLifecycle.js'
 import { headlessProfilerCheckpoint } from './utils/headlessProfiler.js'
+import { getAmbientQueryProviderKey, getOwnedQueryModelSelection, getQueryModelSelection, refreshAmbientQueryModelSelection } from './utils/forkedAgent.js'
 import {
   getDefaultMainLoopModelSetting,
   getProviderRequestModel,
@@ -664,6 +665,16 @@ export async function* query(
   Terminal
 > {
   const consumedCommandUuids: string[] = []
+  // Query clones its context; retained parent references must see the request
+  // selection too (for post-turn cache-sharing forks).
+  // Hooks can shallow-copy a context without using createSubagentContext.
+  // Preserve sharing within this agent, never across an agent boundary.
+  if (
+    !params.toolUseContext.queryModelSelection ||
+    params.toolUseContext.queryModelSelection.agentId !== params.toolUseContext.agentId
+  ) {
+    params.toolUseContext.queryModelSelection = { agentId: params.toolUseContext.agentId }
+  }
   const terminal = yield* queryLoop(params, consumedCommandUuids)
   // Only reached if queryLoop returned normally. Skipped on throw (error
   // propagates through yield*) and on .return() (Return completion closes
@@ -842,6 +853,9 @@ async function* queryLoop(
     // is reassigned within an iteration (queryTracking, messages updates);
     // the rest are read-only between continue sites.
     let { toolUseContext } = state
+    // Existing forks can outlive a provider switch. Refresh before compaction,
+    // capability checks, or request selection consume their concrete model.
+    toolUseContext = refreshAmbientQueryModelSelection(toolUseContext)
     const {
       messages,
       autoCompactTracking,
@@ -1233,6 +1247,12 @@ async function* queryLoop(
       }
     }
 
+    // Compaction can await while the active provider changes. Refresh before
+    // request selection and the tool executor capture this context.
+    toolUseContext = refreshAmbientQueryModelSelection(toolUseContext)
+    const followsProvider = !toolUseContext.agentId ||
+      getQueryModelSelection(toolUseContext)?.followsProvider === true
+
     //TODO: no need to set toolUseContext.messages during set-up since it is updated here
     toolUseContext = {
       ...toolUseContext,
@@ -1265,19 +1285,26 @@ async function* queryLoop(
       appState.mainLoopModelForSession ??
       appState.mainLoopModel ??
       getDefaultMainLoopModelSetting()
-    let currentModel = getRuntimeMainLoopModel({
-      permissionMode,
-      mainLoopModel: parseUserSpecifiedModel(appStateMainLoopModel),
-      exceeds200kTokens:
-        permissionMode === 'plan' &&
-        doesMostRecentAssistantMessageExceed200k(messagesForQuery),
-    })
+    const selectedModel = toolUseContext.agentId
+      ? getQueryModelSelection(toolUseContext)?.requestModel ?? toolUseContext.options.mainLoopModel
+      : appStateMainLoopModel
+    // Children already have an assigned model. Root plan aliases must not
+    // promote that assignment again, even when smart routing is disabled.
+    let currentModel = toolUseContext.agentId
+      ? parseUserSpecifiedModel(toolUseContext.options.mainLoopModel)
+      : getRuntimeMainLoopModel({
+          permissionMode,
+          mainLoopModel: parseUserSpecifiedModel(selectedModel),
+          exceeds200kTokens:
+            permissionMode === 'plan' &&
+            doesMostRecentAssistantMessageExceed200k(messagesForQuery),
+        })
 
     // Smart routing (opt-in): classify once per user turn (transition===undefined)
     // and pin the decision; reuse the pin on every continuation pass. Applied
     // BEFORE the blocking-limit math below so the token-budget guard and the
     // model call agree on the model. Disabled/misconfigured → pin is `routed:false`
-    // and currentModel keeps today's resolution (byte-for-byte unchanged).
+    // and currentModel keeps the root's resolution or child's assigned model.
     if (state.transition === undefined) {
       pinnedTurnRoute = decideTurnModel({
         settings: appState.settings as unknown as Parameters<typeof decideTurnModel>[0]['settings'],
@@ -1289,6 +1316,7 @@ async function* queryLoop(
           turnNumber: deriveUserTurnNumber(messagesForQuery),
         },
         sessionId: getSessionId(),
+        agentId: toolUseContext.agentId,
       })
       if (pinnedTurnRoute.routed === false && pinnedTurnRoute.justDisabledForSession) {
         yield createSystemMessage(
@@ -1532,6 +1560,23 @@ async function* queryLoop(
             // callModel performs async provider preparation.
             params.onModelRequestStart?.()
             modelRequestLifecycleStarted = true
+            const requestModel = pinnedTurnRoute?.routed
+              ? currentModel
+              : getProviderRequestModel(selectedModel, currentModel)
+            const queryModelSelection = toolUseContext.queryModelSelection ??= {
+              agentId: toolUseContext.agentId,
+            }
+            const requestSelection = {
+              options: toolUseContext.options,
+              model: toolUseContext.options.mainLoopModel,
+              selectedModel,
+              runtimeModel: currentModel,
+              requestModel,
+              providerKey: getAmbientQueryProviderKey(),
+              // Automatic model retries may mutate options; that is not an
+              // explicit user choice and must not change the selection origin.
+              followsProvider,
+            }
             for await (const message of deps.callModel({
             messages: prependUserContext(
               injectRequestOnlyMessages(
@@ -1550,9 +1595,7 @@ async function* queryLoop(
                 return appState.toolPermissionContext
               },
               model: currentModel,
-              requestModel: pinnedTurnRoute?.routed
-                ? currentModel
-                : getProviderRequestModel(appStateMainLoopModel, currentModel),
+              requestModel,
               ...(config.gates.fastModeEnabled && {
                 fastMode: appState.fastMode,
               }),
@@ -1604,6 +1647,7 @@ async function* queryLoop(
                   reservedTurnCount = turnCount
                 }
                 providerDispatchAccepted = true
+                queryModelSelection.current = requestSelection
                 params.onProviderDispatchAccepted?.()
                 return true
               },
@@ -2420,6 +2464,9 @@ async function* queryLoop(
       if (isWithheldRateLimit) {
         const fallback = resolveNextFallbackProviderFromState()
         if (fallback !== null) {
+          // Recovery needs the origin even if the active provider changed
+          // while the failed request was in flight; it replaces the pair below.
+          const selection = getOwnedQueryModelSelection(toolUseContext)
           const activated = setActiveProviderProfile(fallback.nextProfileId)
           if (activated) {
             const fromLabel = fallback.fromProfileId ?? 'previous provider'
@@ -2441,7 +2488,23 @@ async function* queryLoop(
                 mainLoopModel: activatedModel,
                 mainLoopModelForSession: null,
               }))
-              toolUseContext.options.mainLoopModel = activatedModel
+              const runtimeModel = parseUserSpecifiedModel(activatedModel)
+              const options = { ...toolUseContext.options, mainLoopModel: runtimeModel }
+              // Recovery replaces the pair, not its origin. Clone so retained
+              // contexts still own their earlier snapshot, even if setAppState
+              // is a no-op in this child.
+              toolUseContext = {
+                ...toolUseContext, options,
+                queryModelSelection: {
+                  agentId: toolUseContext.agentId,
+                  ...(selection && { current: {
+                    ...selection, options, model: runtimeModel,
+                    selectedModel: activatedModel, runtimeModel,
+                    requestModel: getProviderRequestModel(activatedModel, runtimeModel),
+                    providerKey: getAmbientQueryProviderKey(),
+                  } }),
+                },
+              }
             }
             // System informational, NOT an assistant API error. The original
             // 429 is still withheld upstream, so SDK hosts that terminate on
@@ -3101,12 +3164,22 @@ async function* queryLoop(
     if (updatedToolUseContext.options.refreshTools) {
       const refreshedTools = updatedToolUseContext.options.refreshTools()
       if (refreshedTools !== updatedToolUseContext.options.tools) {
+        // A provider can also switch during the tool. Preserve that transition
+        // before cloning options, while the old ownership proof is still valid.
+        updatedToolUseContext = refreshAmbientQueryModelSelection(updatedToolUseContext)
+        const selection = getQueryModelSelection(updatedToolUseContext)
         updatedToolUseContext = {
           ...updatedToolUseContext,
           options: {
             ...updatedToolUseContext.options,
             tools: refreshedTools,
           },
+        }
+        // Keep earlier sampled/retained contexts valid too. Moving a shared
+        // holder's options pointer would invalidate their accepted selections.
+        updatedToolUseContext.queryModelSelection = {
+          agentId: updatedToolUseContext.agentId,
+          ...(selection && { current: { ...selection, options: updatedToolUseContext.options } }),
         }
       }
     }
