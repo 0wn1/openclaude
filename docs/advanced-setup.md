@@ -829,7 +829,13 @@ Notes:
 
 ## Provider Launch Profiles
 
-Use profile launchers to avoid repeated environment setup:
+Use profile launchers to avoid repeated environment setup. The profile defaults
+to `auto` when omitted. Put launcher options (`--fast` and `--goal`) before CLI
+arguments; the first CLI argument starts passthrough, so prompts and option values
+are forwarded unchanged. A leading provider name such as `ollama` still selects
+that profile. To use it as a prompt, pass it as a CLI argument, for example
+`bun run scripts/provider-launch.ts -p ollama`, or pass a `--` separator through
+to the launcher before the prompt (some Bun invocations consume that separator):
 
 ```bash
 # one-time profile bootstrap (prefer viable local Ollama, otherwise OpenAI)
