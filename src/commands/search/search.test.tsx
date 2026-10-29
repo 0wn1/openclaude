@@ -6,13 +6,14 @@ import * as React from 'react'
 
 import { createRoot } from '../../ink.js'
 import { AppStateProvider } from '../../state/AppState.js'
+import { snapshotEnv } from '../../test/envSnapshot.js'
 import {
   acquireSharedMutationLock,
   releaseSharedMutationLock,
 } from '../../test/sharedMutationLock.js'
 import searchCmd from './index.js'
-import { setSearchEnvStoreForTests } from './search.js'
-import type { SearchEnvStore } from './searchSettings.js'
+import { backendDescription, setSearchEnvStoreForTests } from './search.js'
+import { findSearchBackend, type SearchEnvStore } from './searchSettings.js'
 
 // An in-memory store stands in for the global config so these flows never
 // read the developer's settings files or write ~/.openclaude.json, and so
@@ -31,13 +32,24 @@ const memoryStore: SearchEnvStore = {
 const SYNC_START = '\x1B[?2026h'
 const SYNC_END = '\x1B[?2026l'
 
-const ENV_KEYS = ['WEB_SEARCH_PROVIDER', 'EXA_API_KEY', 'TAVILY_API_KEY', 'ANYSEARCH_API_KEY', 'KEENABLE_API_KEY'] as const
-const savedEnv = Object.fromEntries(ENV_KEYS.map(k => [k, process.env[k]]))
+const ENV_KEYS = [
+  'WEB_SEARCH_PROVIDER',
+  'EXA_API_KEY',
+  'TAVILY_API_KEY',
+  'ANYSEARCH_API_KEY',
+  'KEENABLE_API_KEY',
+  'AIMLAPI_API_KEY',
+  'OPENAI_API_KEY',
+  'OPENAI_BASE_URL',
+  'OPENAI_API_BASE',
+  'CLAUDE_CODE_PROVIDER_ROUTE_ID',
+] as const
+let restoreEnv: () => void = () => {}
 const originalFetch = globalThis.fetch
 
 beforeEach(async () => {
   await acquireSharedMutationLock('commands/search/search.test.tsx')
-  for (const key of ENV_KEYS) delete process.env[key]
+  restoreEnv = snapshotEnv(ENV_KEYS, { clear: true })
   for (const key of Object.keys(savedEnvBlock)) delete savedEnvBlock[key]
   setSearchEnvStoreForTests(memoryStore)
 })
@@ -46,10 +58,7 @@ afterEach(() => {
   try {
     setSearchEnvStoreForTests(undefined)
     globalThis.fetch = originalFetch
-    for (const [key, value] of Object.entries(savedEnv)) {
-      if (value === undefined) delete process.env[key]
-      else process.env[key] = value
-    }
+    restoreEnv()
   } finally {
     releaseSharedMutationLock()
   }
@@ -191,6 +200,14 @@ describe('/search command', () => {
     expect(frame).toContain('needs TAVILY_API_KEY')
   })
 
+  test('the picker shows whether AI/ML API has the provider key', () => {
+    const aimlapi = findSearchBackend('aimlapi')!
+    expect(backendDescription(aimlapi)).toEndWith(' · needs AIMLAPI_API_KEY (set up with /provider)')
+
+    process.env.AIMLAPI_API_KEY = 'aiml-provider-key'
+    expect(backendDescription(aimlapi)).toEndWith(' · uses your AI/ML API key')
+  })
+
   test('direct selection enables AnySearch without opening a key dialog', async () => {
     const { text, mounted } = await runSearch('anysearch')
 
@@ -205,6 +222,23 @@ describe('/search command', () => {
     expect(mounted).toBeUndefined()
     expect(text).toBe('Web search set to Keenable.')
     expect(savedEnvBlock).toEqual({ WEB_SEARCH_PROVIDER: 'keenable' })
+  })
+
+  test('AI/ML API is selected with the provider key and never asks for or saves one', async () => {
+    const missing = await runSearch('aimlapi')
+    expect(missing.mounted).toBeUndefined()
+    expect(missing.text).toStartWith('Web search settings unchanged. AI/ML API uses AIMLAPI_API_KEY')
+    expect(savedEnvBlock).toEqual({})
+
+    const key = await runSearch('key aimlapi')
+    expect(key.mounted).toBeUndefined()
+    expect(key.text).toContain('/search does not store it')
+
+    process.env.AIMLAPI_API_KEY = 'aiml-provider-key'
+    const selected = await runSearch('aimlapi')
+    expect(selected.mounted).toBeUndefined()
+    expect(selected.text).toStartWith('Web search set to AI/ML API.')
+    expect(savedEnvBlock).toEqual({ WEB_SEARCH_PROVIDER: 'aimlapi' })
   })
 
   test('typing a key saves the backend and key without ever showing the key', async () => {
